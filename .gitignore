@@ -1,0 +1,6 @@
+*
+!.gitignore
+!AudioEngine.cpp
+!LockFreeRingBuffer.h
+!miniaudio_impl.cpp
+!miniaudio.h
