@@ -1,7 +1,1 @@
-*
-!.gitignore
-!CMakeLists.txt
-!AudioEngine.cpp
-!LockFreeRingBuffer.h
-!miniaudio_impl.cpp
-!miniaudio.h
+include/audio
