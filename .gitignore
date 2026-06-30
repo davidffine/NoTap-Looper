@@ -1,7 +1,11 @@
 *
 !.gitignore
 !CMakeLists.txt
-!AudioEngine.cpp
-!LockFreeRingBuffer.h
-!miniaudio_impl.cpp
-!miniaudio.h
+!include/LooperEngine.hpp
+!include/OboeBridge.hpp
+!include/LockFreeRingBuffer.hpp
+!include/miniaudio.h
+!src/JNIBridge.cpp
+!src/LooperEngine.cpp
+!src/OboeBridge.cpp
+!src/miniaudio_impl.cpp
