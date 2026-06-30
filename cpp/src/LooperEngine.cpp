@@ -1,5 +1,5 @@
-#include "LooperEngine.hpp"
-#include <../include/audio/audio.h>
+#include "../headers/LooperEngine.hpp"
+#include "../includes/kissfft/kiss_fftr.h"
 #include <iostream>
 #include <cmath>
 #include <numeric>
@@ -164,94 +164,64 @@ size_t LooperEngine::find_true_onset(const std::vector<float>& audio_data, size_
     return 0;
 }
 
+// פונקציית ה-novelty החדשה, המבוססת על Frequency-Domain
 std::vector<float> LooperEngine::extract_novelty_curve(const std::vector<float>& audio_data, int env_sr, int& out_chunk_size) {
-    out_chunk_size = config_.sample_rate / env_sr;
-    std::vector<float> env;
-    env.reserve(audio_data.size() / out_chunk_size + 1);
-    for (size_t i = 0; i < audio_data.size(); i += out_chunk_size) {
-        float sum = 0.0f;
-        size_t count = 0;
-        for (size_t j = i; j < i + out_chunk_size && j < audio_data.size(); ++j) {
-            sum += audio_data[j] * audio_data[j];
-            count++;
+    // גודל חלון ה-FFT. קובע את הרזולוציה בתדר מול הזמן.
+    const int NFFT = 1024;
+    const int HOP_SIZE = NFFT / 2; // חפיפה של 50%
+
+    // קביעת קצב הדגימה הווירטואלי של העקומה
+    out_chunk_size = HOP_SIZE;
+
+    std::vector<float> novelty;
+    if (audio_data.size() < NFFT) return novelty;
+
+    novelty.reserve(audio_data.size() / HOP_SIZE);
+
+    // אתחול KissFFT עבור ערכים ממשיים
+    kiss_fftr_cfg fft_cfg = kiss_fftr_alloc(NFFT, 0, nullptr, nullptr);
+    std::vector<kiss_fft_scalar> time_in(NFFT, 0.0f);
+    std::vector<kiss_fft_cpx> freq_out(NFFT / 2 + 1);
+
+    std::vector<float> prev_magnitudes(NFFT / 2 + 1, 0.0f);
+
+    // מעבר על האודיו בחלונות קופצים
+    for (size_t i = 0; i + NFFT <= audio_data.size(); i += HOP_SIZE) {
+        // 1. החלת חלון (Hann Window) למניעת זליגת תדרים בקצוות
+        for (int j = 0; j < NFFT; ++j) {
+            float hann_multiplier = 0.5f * (1.0f - std::cos(2.0f * M_PI * j / (NFFT - 1)));
+            time_in[j] = audio_data[i + j] * hann_multiplier;
         }
-        env.push_back(std::sqrt(sum / count));
+
+        // 2. ביצוע התמרת פורייה
+        kiss_fftr(fft_cfg, time_in.data(), freq_out.data());
+
+        float current_flux = 0.0f;
+
+        // 3. חישוב ה-Spectral Flux (המשוואה המדוברת)
+        for (int k = 0; k <= NFFT / 2; ++k) {
+            // חישוב מגניטודה של המספר המרוכב
+            float real = freq_out[k].r;
+            float imag = freq_out[k].i;
+            float magnitude = std::sqrt(real * real + imag * imag);
+
+            // חישוב ההפרש בין החלון הנוכחי לקודם
+            float diff = magnitude - prev_magnitudes[k];
+
+            // Half-wave rectification (הוספת אנרגיה חדשה בלבד)
+            if (diff > 0.0f) {
+                current_flux += diff;
+            }
+
+            prev_magnitudes[k] = magnitude;
+        }
+
+        novelty.push_back(current_flux);
     }
-    std::vector<float> novelty(env.size(), 0.0f);
-    for (size_t i = 1; i < env.size(); ++i) {
-        float diff = env[i] - env[i - 1];
-        novelty[i] = (diff > 0.0f) ? diff : 0.0f;
-    }
+
+    kiss_fftr_free(fft_cfg);
+
     return novelty;
-}
-
-float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& audio_data) {
-    std::cout << "[DSP] Initiating Spectral Flux Analysis via Aubio..." << std::endl;
-
-    // הגנה בסיסית: אם ההקלטה קצרה משנייה, נחזיר ערך ברירת מחדל
-    if (audio_data.size() < static_cast<size_t>(config_.sample_rate)) {
-        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
-        return (60.0f / 120.0f) * config_.sample_rate;
-    }
-
-    uint_t win_s = 1024; // גודל חלון ה-FFT
-    uint_t hop_s = 512;  // קפיצת החלון (חפיפה של 50%)
-    uint_t samplerate = config_.sample_rate;
-
-    // אתחול אובייקט הקצב של Aubio - משתמש כברירת מחדל ב-Spectral Flux
-    aubio_tempo_t* tempo = new_aubio_tempo("default", win_s, hop_s, samplerate);
-    fvec_t* in = new_fvec(hop_s);
-    fvec_t* out = new_fvec(2); // מכיל את התוצאה: האם הייתה פעימה ומיקומה
-
-    std::vector<float> beat_positions;
-    size_t num_frames = audio_data.size();
-
-    // הזנת האודיו לתוך האלגוריתם במקטעים של hop_s
-    for (size_t i = 0; i + hop_s < num_frames; i += hop_s) {
-        // העתקת הדגימות למבנה הנתונים של Aubio
-        for (uint_t j = 0; j < hop_s; j++) {
-            in->data[j] = audio_data[i + j];
-        }
-
-        // ביצוע אנליזת תדרים ומציאת פיקים
-        aubio_tempo_do(tempo, in, out);
-
-        // אם out->data[0] שונה מאפס, זוהתה פעימה
-        if (out->data[0] != 0.0f) {
-            beat_positions.push_back(static_cast<float>(i));
-        }
-    }
-
-    // ניקוי זיכרון (C-style)
-    del_aubio_tempo(tempo);
-    del_fvec(in);
-    del_fvec(out);
-
-    // אם לא נמצאו מספיק פעימות כדי לחשב מרווח
-    if (beat_positions.size() < 2) {
-        std::cout << "[DSP] Warning: Not enough beats detected. Defaulting to 120 BPM." << std::endl;
-        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
-        return (60.0f / 120.0f) * config_.sample_rate;
-    }
-
-    // חישוב המרווחים (בדגימות) בין כל שתי פעימות עוקבות
-    std::vector<float> intervals;
-    intervals.reserve(beat_positions.size() - 1);
-    for (size_t i = 1; i < beat_positions.size(); ++i) {
-        intervals.push_back(beat_positions[i] - beat_positions[i - 1]);
-    }
-
-    // חישוב החציון (Median) - מתמטית אמין יותר מממוצע כדי להתעלם מזיופים ופספוסים
-    std::sort(intervals.begin(), intervals.end());
-    float median_interval = intervals[intervals.size() / 2];
-
-    // המרת המרווח ל-BPM
-    float calculated_bpm = 60.0f / (median_interval / config_.sample_rate);
-    estimated_bpm_.store(calculated_bpm, std::memory_order_relaxed);
-
-    std::cout << "[DSP] Analyzed BPM: " << calculated_bpm << std::endl;
-
-    return median_interval;
 }
 
 float LooperEngine::quantize_to_musical_phrase(float raw_beats) {
@@ -270,6 +240,81 @@ float LooperEngine::quantize_to_musical_phrase(float raw_beats) {
         if (penalty < min_penalty) { min_penalty = penalty; best_match = candidate; }
     }
     return best_match;
+}
+
+float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& audio_data) {
+    std::cout << "[DSP] Running Energy-Weighted Transient Histogram Analysis (KissFFT)..." << std::endl;
+
+    if (audio_data.size() < static_cast<size_t>(config_.sample_rate)) {
+        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
+        return (60.0f / 120.0f) * config_.sample_rate;
+    }
+
+    int chunk_size = 0;
+    // הפקת עקומת הטרנזיינטים ממרחב התדר (Frequency-Domain)
+    std::vector<float> novelty = extract_novelty_curve(audio_data, 0, chunk_size);
+
+    if (novelty.empty() || chunk_size == 0) {
+        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
+        return (60.0f / 120.0f) * config_.sample_rate;
+    }
+
+    float mean_nov = std::accumulate(novelty.begin(), novelty.end(), 0.0f) / novelty.size();
+    float peak_threshold = mean_nov * 1.5f;
+
+    struct TransientEvent { int index; float energy; };
+    std::vector<TransientEvent> transients;
+
+    // זיהוי חתימות תדר חזקות (Peaks) בעקומת הספקטרום
+    for (size_t i = 1; i < novelty.size() - 1; ++i) {
+        if (novelty[i] > peak_threshold && novelty[i] > novelty[i - 1] && novelty[i] > novelty[i + 1]) {
+            // חסם מינימלי בין פעימות למניעת זיהוי כפול
+            if (transients.empty() || (static_cast<int>(i) - transients.back().index) > 2) {
+                transients.push_back({static_cast<int>(i), novelty[i]});
+            }
+        }
+    }
+
+    if (transients.size() < 2) {
+        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
+        return (60.0f / 120.0f) * config_.sample_rate;
+    }
+
+    // קצב הדגימה החדש של עקומת ה-novelty
+    int env_sr = config_.sample_rate / chunk_size;
+    int min_lag_chunks = static_cast<int>((60.0f / 240.0f) * env_sr);
+    int max_lag_chunks = static_cast<int>((60.0f / 45.0f) * env_sr);
+
+    std::vector<float> energy_histogram(max_lag_chunks + 1, 0.0f);
+
+    // מילוי ההיסטוגרמה
+    for (size_t i = 0; i < transients.size(); ++i) {
+        for (size_t j = i + 1; j < transients.size(); ++j) {
+            int lag = transients[j].index - transients[i].index;
+            if (lag >= min_lag_chunks && lag <= max_lag_chunks) {
+                float weight = transients[i].energy * transients[j].energy;
+                energy_histogram[lag] += weight;
+                // פיזור קל לריכוך חוסר-דיוק אנושי בנגינה
+                if (lag > min_lag_chunks) energy_histogram[lag - 1] += weight * 0.5f;
+                if (lag < max_lag_chunks) energy_histogram[lag + 1] += weight * 0.5f;
+            }
+        }
+    }
+
+    int best_lag_chunks = min_lag_chunks;
+    float max_energy = -1.0f;
+    for (int lag = min_lag_chunks; lag <= max_lag_chunks; ++lag) {
+        if (energy_histogram[lag] > max_energy) {
+            max_energy = energy_histogram[lag];
+            best_lag_chunks = lag;
+        }
+    }
+
+    float refined_beat_samples = static_cast<float>(best_lag_chunks) * chunk_size;
+    float calculated_bpm = 60.0f / (refined_beat_samples / config_.sample_rate);
+    estimated_bpm_.store(calculated_bpm, std::memory_order_relaxed);
+
+    return refined_beat_samples;
 }
 
 std::vector<float> LooperEngine::apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples) {
