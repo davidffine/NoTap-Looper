@@ -317,6 +317,14 @@ float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& au
     return refined_beat_samples;
 }
 
+void LooperEngine::execute_record_start_command() {
+    request_record_start_.store(true, std::memory_order_relaxed);
+}
+
+void LooperEngine::execute_record_stop_command() {
+    request_record_stop_.store(true, std::memory_order_relaxed);
+}
+
 std::vector<float> LooperEngine::apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples) {
     if (audio.size() <= crossfade_samples * 2) return audio;
     size_t len = audio.size();
@@ -347,6 +355,7 @@ void LooperEngine::process_audio_asynchronously() {
     float peak_recording_rms = 0.0f;
     size_t silence_samples_count = 0;
     float sample;
+    float prev_volume = 0.0f;
 
     while (is_running_.load(std::memory_order_relaxed)) {
 
@@ -371,6 +380,15 @@ void LooperEngine::process_audio_asynchronously() {
         if (local_chunk.empty()) { std::this_thread::yield(); continue; }
 
         float volume = calculate_rms(local_chunk);
+        current_rms_.store(volume, std::memory_order_relaxed);
+        current_noise_std_dev_.store(noise_tracker_.get_std_dev(), std::memory_order_relaxed);
+
+        if (volume > noise_tracker_.get_onset_threshold() && volume > prev_volume * 1.5f) {
+            transient_hit_flag_.store(true, std::memory_order_relaxed);
+        }
+
+        prev_volume = volume;
+
         LooperState state = current_state_.load(std::memory_order_relaxed);
 
         switch (state) {
@@ -387,7 +405,15 @@ void LooperEngine::process_audio_asynchronously() {
                     preroll_buffer_[preroll_write_idx_] = s;
                     preroll_write_idx_ = (preroll_write_idx_ + 1) % max_preroll_samples;
                 }
-                if (volume > noise_tracker_.get_onset_threshold() && volume > ABSOLUTE_MIN_ONSET_RMS) {
+
+                int mode = detection_mode_.load(std::memory_order_relaxed);
+
+                // טריגר אוטומטי (למצבים 0 ו-2)
+                bool auto_triggered = (mode != 1) && (volume > noise_tracker_.get_onset_threshold() && volume > ABSOLUTE_MIN_ONSET_RMS);
+                // טריגר ידני מהנגן (למצב 1: Tap & Trim)
+                bool manual_triggered = (mode == 1) && request_record_start_.exchange(false, std::memory_order_relaxed);
+
+                if (auto_triggered || manual_triggered) {
                     recorded_audio.clear();
                     for (size_t i = 0; i < max_preroll_samples; ++i) {
                         size_t read_idx = (preroll_write_idx_ + i) % max_preroll_samples;
@@ -406,21 +432,31 @@ void LooperEngine::process_audio_asynchronously() {
                 recorded_audio.insert(recorded_audio.end(), local_chunk.begin(), local_chunk.end());
                 if (volume > peak_recording_rms) peak_recording_rms = volume;
 
-                float dynamic_silence_threshold = std::max(noise_tracker_.get_silence_threshold(), peak_recording_rms * 0.04f);
-                size_t dynamic_silence_target = static_cast<size_t>(3.5f * config_.sample_rate);
+                int mode = detection_mode_.load(std::memory_order_relaxed);
 
-                if (volume < dynamic_silence_threshold) {
-                    silence_samples_count += local_chunk.size();
-                    if (silence_samples_count >= dynamic_silence_target) {
+                if (mode == 1) {
+                    // מצב Tap & Trim: המכונה ממתינה להחלטה אנושית מפורשת כדי לעצור
+                    if (request_record_stop_.exchange(false, std::memory_order_relaxed)) {
                         current_state_.store(LooperState::PROCESSING, std::memory_order_release);
                     }
                 } else {
-                    if (volume > peak_recording_rms * 0.15f) {
-                        if (silence_samples_count > 0) silence_samples_count = 0;
+                    // מצב Auto Silence: המכונה מחליטה מתי לעצור על בסיס דעיכת האנרגיה
+                    float dynamic_silence_threshold = std::max(noise_tracker_.get_silence_threshold(), peak_recording_rms * 0.04f);
+                    size_t dynamic_silence_target = static_cast<size_t>(3.5f * config_.sample_rate);
+
+                    if (volume < dynamic_silence_threshold) {
+                        silence_samples_count += local_chunk.size();
+                        if (silence_samples_count >= dynamic_silence_target) {
+                            current_state_.store(LooperState::PROCESSING, std::memory_order_release);
+                        }
                     } else {
-                        size_t penalty = local_chunk.size() * 3;
-                        if (silence_samples_count > penalty) silence_samples_count -= penalty;
-                        else silence_samples_count = 0;
+                        if (volume > peak_recording_rms * 0.15f) {
+                            if (silence_samples_count > 0) silence_samples_count = 0;
+                        } else {
+                            size_t penalty = local_chunk.size() * 3;
+                            if (silence_samples_count > penalty) silence_samples_count -= penalty;
+                            else silence_samples_count = 0;
+                        }
                     }
                 }
                 break;

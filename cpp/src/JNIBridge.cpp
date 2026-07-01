@@ -1,8 +1,8 @@
 #ifdef __ANDROID__
 #include <jni.h>
 #include <string>
-#include "LooperEngine.hpp"
-#include "OboeBridge.hpp"
+#include "../headers/LooperEngine.hpp"
+#include "../headers/OboeBridge.hpp"
 
 static LooperEngine* g_engine = nullptr;
 static OboeLooperEngine* g_oboe_bridge = nullptr;
@@ -16,6 +16,34 @@ Java_com_notap_looper_AudioEngine_startEngine(JNIEnv *env, jobject thiz) {
         g_oboe_bridge = new OboeLooperEngine(*g_engine);
         g_oboe_bridge->start();
     }
+}
+
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_executeRecordStart(JNIEnv *env, jobject thiz) {
+    if (g_engine) {
+        g_engine->execute_record_start_command();
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_executeRecordStop(JNIEnv *env, jobject thiz) {
+    if (g_engine) {
+        g_engine->execute_record_stop_command();
+    }
+}
+
+// בתוך JNIBridge.cpp
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *env, jobject thiz, jfloatArray outData) {
+    if (!g_engine) return;
+
+    jfloat telemetry[3];
+    telemetry[0] = g_engine->current_rms_.load(std::memory_order_relaxed);
+    telemetry[1] = g_engine->current_noise_std_dev_.load(std::memory_order_relaxed);
+
+    // קריאה ואיפוס אטומי של דגל הטרנזיינט
+    bool hit = g_engine->transient_hit_flag_.exchange(false, std::memory_order_relaxed);
+    telemetry[2] = hit ? 1.0f : 0.0f;
+
+    // כתיבה חזרה למערך של Kotlin ללא הקצאות זיכרון חדשות
+    env->SetFloatArrayRegion(outData, 0, 3, telemetry);
 }
 
 JNIEXPORT void JNICALL

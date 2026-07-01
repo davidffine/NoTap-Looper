@@ -55,6 +55,7 @@ public:
     float get_onset_threshold() const;
     float get_silence_threshold() const;
     float get_mean() const;
+    float get_std_dev() const { return current_std_dev_; }
 };
 
 class LooperEngine {
@@ -75,6 +76,8 @@ private:
     std::vector<float> preroll_buffer_;
     size_t preroll_write_idx_{0};
 
+    std::atomic<bool> request_record_start_{false};
+    std::atomic<bool> request_record_stop_{false};
     std::atomic<bool> request_overdub_{false};
     std::atomic<bool> request_looping_{false};
     std::atomic<bool> request_clear_{false};
@@ -98,11 +101,16 @@ public:
     explicit LooperEngine(EngineConfig config = EngineConfig{});
     ~LooperEngine();
 
+    std::atomic<float> current_rms_{0.0f};
+    std::atomic<float> current_noise_std_dev_{0.0f};
+    std::atomic<bool> transient_hit_flag_{false};
+
     void execute_overdub_command();
     void execute_loop_command();
     void execute_clear_command();
 
-    // [חדש] פונקציה לעדכון המצב
+    void execute_record_start_command();
+    void execute_record_stop_command();
     void set_detection_mode(int mode);
 
     float get_estimated_bpm() const;

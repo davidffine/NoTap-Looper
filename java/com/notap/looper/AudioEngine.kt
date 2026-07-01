@@ -9,6 +9,11 @@ class AudioEngine {
     external fun startEngine()
     external fun stopEngine()
 
+    external fun executeRecordStart()
+    external fun executeRecordStop()
+
+    external fun pollTelemetry(outData: FloatArray)
+
     external fun executeOverdub()
     external fun executeLoop()
     external fun clearLoop()

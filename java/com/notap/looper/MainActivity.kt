@@ -1,117 +1,230 @@
 package com.notap.looper
 
 import android.Manifest
+import android.animation.ArgbEvaluator
+import android.animation.ValueAnimator
 import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Canvas
-import android.graphics.Color
-import android.graphics.Paint
-import android.graphics.RectF
-import android.graphics.Typeface
+import android.graphics.*
 import android.graphics.drawable.GradientDrawable
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.view.Choreographer
+import android.view.GestureDetector
 import android.view.Gravity
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.OvershootInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import kotlin.math.abs
 
 // ==========================================
-// מנוע ציור: טבעת התקדמות עם אפקט Glow
+// System Ontology: Typed States
 // ==========================================
-class RingProgressView(context: Context) : View(context) {
-    var progress: Float = 0f
-        set(value) {
-            field = value
-            invalidate()
+enum class EngineState {
+    IDLE, RECORDING, PROCESSING, LOOPING, OVERDUBBING, CALIBRATING, UNKNOWN;
+
+    companion object {
+        fun fromString(state: String?): EngineState {
+            return entries.find { it.name == state } ?: UNKNOWN
         }
-
-    var ringColor: Int = Color.parseColor("#333333")
-        set(value) {
-            field = value
-            progressPaint.color = value
-            // הוספת אפקט זוהר חזותי לטבעת
-            progressPaint.setShadowLayer(25f, 0f, 0f, value)
-            invalidate()
-        }
-
-    init {
-        // קריטי: מאפשר רינדור של הצללות והילות (Glow) בקנבס
-        setLayerType(LAYER_TYPE_SOFTWARE, null)
-    }
-
-    private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.parseColor("#121212")
-        style = Paint.Style.STROKE
-        strokeWidth = 30f
-        strokeCap = Paint.Cap.ROUND
-    }
-
-    private val progressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeWidth = 30f
-        strokeCap = Paint.Cap.ROUND
-    }
-
-    private val rect = RectF()
-
-    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
-        super.onSizeChanged(w, h, oldw, oldh)
-        val pad = 60f
-        rect.set(pad, pad, w - pad, h - pad)
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        canvas.drawArc(rect, 0f, 360f, false, backgroundPaint)
-        // הציור מתחיל מ-12 בלילה (-90 מעלות)
-        canvas.drawArc(rect, -90f, progress * 360f, false, progressPaint)
     }
 }
 
 // ==========================================
-// ממשק המשתמש הראשי
+// 1. Comet Ring: Optimized Time Representation
+// ==========================================
+class CometRingView(context: Context) : View(context) {
+
+    var progress: Float = 0f
+        set(value) {
+            field = value
+            updateMatrix()
+            invalidate()
+        }
+
+    private var _ringColor: Int = Color.parseColor("#333333")
+    var ringColor: Int
+        get() = _ringColor
+        set(value) {
+            if (_ringColor != value) animateColorChange(_ringColor, value)
+        }
+
+    private val matrix = Matrix()
+    private var sweepGradient: SweepGradient? = null
+    private val rect = RectF()
+
+    private val backgroundTrackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.parseColor("#0A0A0A")
+        style = Paint.Style.STROKE
+        strokeWidth = 24f
+    }
+
+    private val cometPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 24f
+        strokeCap = Paint.Cap.ROUND
+    }
+
+    private var colorAnimator: ValueAnimator? = null
+
+    init {
+        setLayerType(LAYER_TYPE_SOFTWARE, null)
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        super.onSizeChanged(w, h, oldw, oldh)
+        val pad = 40f
+        rect.set(pad, pad, w - pad, h - pad)
+        rebuildGradient()
+    }
+
+    private fun rebuildGradient() {
+        val cx = width / 2f
+        val cy = height / 2f
+        val colors = intArrayOf(Color.TRANSPARENT, _ringColor, _ringColor)
+        val positions = floatArrayOf(0f, Math.max(progress * 0.9f, 0.01f), 1f)
+        sweepGradient = SweepGradient(cx, cy, colors, positions)
+        cometPaint.shader = sweepGradient
+        cometPaint.setShadowLayer(35f, 0f, 0f, _ringColor)
+        updateMatrix()
+    }
+
+    private fun updateMatrix() {
+        sweepGradient?.let {
+            matrix.setRotate(-90f, width / 2f, height / 2f)
+            it.setLocalMatrix(matrix)
+        }
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        val cx = width / 2f
+        val cy = height / 2f
+        canvas.drawCircle(cx, cy, rect.width() / 2f, backgroundTrackPaint)
+
+        if (progress > 0.01f) {
+            canvas.drawArc(rect, -90f, progress * 360f, false, cometPaint)
+        }
+    }
+
+    private fun animateColorChange(fromColor: Int, toColor: Int) {
+        colorAnimator?.cancel()
+        colorAnimator = ValueAnimator.ofObject(ArgbEvaluator(), fromColor, toColor).apply {
+            duration = 300
+            interpolator = AccelerateDecelerateInterpolator()
+            addUpdateListener { animator ->
+                _ringColor = animator.animatedValue as Int
+                rebuildGradient()
+                invalidate()
+            }
+            start()
+        }
+    }
+}
+
+// ==========================================
+// 2. Ripple Emitter: Acoustic String Physics
+// ==========================================
+class RippleEmitterView(context: Context) : View(context) {
+    private class Ripple(var radius: Float, var alpha: Float)
+    private val ripples = mutableListOf<Ripple>()
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private var maxRadius = 0f
+    private var initialRadius = 0f
+
+    fun fireRipple(color: Int) {
+        paint.color = color
+        ripples.add(Ripple(initialRadius, 1f))
+        invalidate()
+    }
+
+    override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
+        maxRadius = Math.max(w, h) / 1.4f
+        initialRadius = Math.min(w, h) / 3f
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        if (ripples.isEmpty()) return
+        val cx = width / 2f
+        val cy = height / 2f
+        var needsNextFrame = false
+        val iterator = ripples.iterator()
+
+        while (iterator.hasNext()) {
+            val r = iterator.next()
+            paint.alpha = (r.alpha * 60).toInt() // Peak opacity ~23%
+            canvas.drawCircle(cx, cy, r.radius, paint)
+
+            // Non-linear acoustic physics (ADSR mimic)
+            r.radius += (maxRadius - r.radius) * 0.18f // Easing out expansion
+            r.alpha *= 0.88f                           // Exponential decay
+
+            if (r.alpha <= 0.01f) {
+                iterator.remove()
+            } else {
+                needsNextFrame = true
+            }
+        }
+        if (needsNextFrame) invalidate()
+    }
+}
+
+// ==========================================
+// 3. The Studio Engine (Main Activity)
 // ==========================================
 class MainActivity : AppCompatActivity() {
 
     private var audioEngine: AudioEngine? = null
 
+    // UI Components
     private lateinit var modeText: TextView
     private lateinit var statusText: TextView
     private lateinit var bpmText: TextView
-    private lateinit var ringView: RingProgressView
-    private lateinit var actionLabel: TextView
-    private lateinit var actionContainer: FrameLayout
-    private lateinit var clearText: TextView
+    private lateinit var cometRing: CometRingView
+    private lateinit var rippleEmitter: RippleEmitterView
+    private lateinit var stompLabel: TextView
+    private lateinit var stompContainer: FrameLayout
 
     private var currentModeIndex = 0
-    private val modes = arrayOf("MODE: AUTO SILENCE", "MODE: TAP & TRIM", "MODE: FIXED BPM")
+    private val modes = arrayOf("AUTO SILENCE", "TAP & TRIM", "FIXED BPM")
+    private var lastKnownState = EngineState.UNKNOWN
 
-    // פלטת צבעי סטודיו מודרנית
-    private val colorIdle = Color.parseColor("#00E5FF")     // כחול סייבר
-    private val colorRecord = Color.parseColor("#FF1744")   // אדום אזהרה
-    private val colorPlay = Color.parseColor("#00E676")     // ירוק זוהר
-    private val colorOverdub = Color.parseColor("#FF9100")  // כתום
-    private val colorDarkBg = Color.parseColor("#050505")   // שחור פחם לחלל האפליקציה
-    private val colorPanel = Color.parseColor("#141414")    // אפור עמוק לפאנלים
+    // Hardware Color Palette
+    private val palette = object {
+        val cyan   = Color.parseColor("#00E5FF")
+        val red    = Color.parseColor("#FF1744")
+        val green  = Color.parseColor("#00E676")
+        val amber  = Color.parseColor("#FF9100")
+        val void   = Color.parseColor("#000000")
+        val idle   = Color.parseColor("#222222")
+    }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private val telemetryRunnable = object : Runnable {
-        override fun run() {
-            updateTelemetry()
-            mainHandler.postDelayed(this, 16)
+    private var pulseAnimator: ValueAnimator? = null
+    private val telemetryBuffer = FloatArray(3)
+
+    // Jitter low-pass filter states
+    private var currentJitterX = 0f
+    private var currentJitterY = 0f
+
+    // Hardware Vsync callback
+    private val frameCallback = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            pollAndRender()
+            Choreographer.getInstance().postFrameCallback(this)
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-
-        setupPolishedUI()
+        setupStudioUI()
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.RECORD_AUDIO), 1)
@@ -122,148 +235,146 @@ class MainActivity : AppCompatActivity() {
 
     private fun Number.dpToPx(): Int = (this.toFloat() * resources.displayMetrics.density).toInt()
 
-    private fun createRoundedDrawable(bgColor: Int, radiusDp: Float, strokeColor: Int? = null, strokeWidthDp: Float = 2f): GradientDrawable {
-        return GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = radiusDp.dpToPx().toFloat()
-            setColor(bgColor)
-            if (strokeColor != null) {
-                setStroke(strokeWidthDp.dpToPx(), strokeColor)
-            }
-        }
-    }
-
-    private fun setupPolishedUI() {
+    private fun setupStudioUI() {
         val rootLayout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setBackgroundColor(colorDarkBg)
-            setPadding(24.dpToPx(), 48.dpToPx(), 24.dpToPx(), 48.dpToPx())
+            setBackgroundColor(palette.void)
+            setPadding(0, 48.dpToPx(), 0, 0)
         }
 
-        // בורר מצבים
-        modeText = TextView(this).apply {
-            text = modes[currentModeIndex]
-            textSize = 13f
-            typeface = Typeface.MONOSPACE
-            letterSpacing = 0.1f
-            setTextColor(colorIdle)
-            background = createRoundedDrawable(colorPanel, 8f, colorIdle, 1f)
-            setPadding(24.dpToPx(), 12.dpToPx(), 24.dpToPx(), 12.dpToPx())
-            setOnClickListener { cycleDetectionMode() }
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, 48.dpToPx()) }
-        }
-
-        // צג סטטוס מרכזי
-        statusText = TextView(this).apply {
-            text = "BOOTING..."
-            textSize = 26f
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 0.1f
-            setTextColor(Color.WHITE)
+        val lcdScreen = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.RECTANGLE
+                cornerRadius = 16f.dpToPx().toFloat()
+                colors = intArrayOf(Color.parseColor("#15181E"), Color.parseColor("#0A0B0E"))
+                setStroke(2.dpToPx(), Color.parseColor("#22252A"))
+            }
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
+                320.dpToPx(),
                 LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, 4.dpToPx()) }
+            ).apply { setMargins(0, 0, 0, 72.dpToPx()) }
+            setPadding(0, 24.dpToPx(), 0, 24.dpToPx())
+            elevation = 12f
         }
 
-        // צג BPM דיגיטלי
+        modeText = TextView(this).apply {
+            text = "MODE: ${modes[currentModeIndex]}"
+            textSize = 12f
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.2f
+            setTextColor(Color.parseColor("#707885"))
+        }
+
+        statusText = TextView(this).apply {
+            text = "BOOTING"
+            textSize = 28f
+            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+            letterSpacing = 0.05f
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { setMargins(0, 8.dpToPx(), 0, 4.dpToPx()) }
+        }
+
         bpmText = TextView(this).apply {
             text = "BPM: --"
-            textSize = 18f
+            textSize = 14f
             typeface = Typeface.MONOSPACE
-            setTextColor(Color.parseColor("#555555"))
-            gravity = Gravity.CENTER
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { setMargins(0, 0, 0, 48.dpToPx()) }
+            letterSpacing = 0.1f
+            setTextColor(Color.parseColor("#505560"))
         }
 
-        // מארז הפדאל
+        lcdScreen.addView(modeText)
+        lcdScreen.addView(statusText)
+        lcdScreen.addView(bpmText)
+
+        val gestureDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onFling(e1: MotionEvent?, e2: MotionEvent, velocityX: Float, velocityY: Float): Boolean {
+                if (abs(velocityX) > 200) {
+                    cycleDetectionMode(if (velocityX > 0) 1 else -1)
+                    lcdScreen.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                    return true
+                }
+                return false
+            }
+        })
+        lcdScreen.setOnTouchListener { _, event -> gestureDetector.onTouchEvent(event); true }
+
         val pedalContainer = FrameLayout(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                340.dpToPx(),
-                340.dpToPx()
-            ).apply { setMargins(0, 0, 0, 64.dpToPx()) }
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
         }
 
-        ringView = RingProgressView(this).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
+        rippleEmitter = RippleEmitterView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
-        // כפתור אקטיבי - שימוש ב-FrameLayout כדי לעקוף את המגבלות של אנדרואיד
-        actionContainer = FrameLayout(this).apply {
-            val btnSize = 220.dpToPx()
+        cometRing = CometRingView(this).apply {
+            layoutParams = FrameLayout.LayoutParams(340.dpToPx(), 340.dpToPx()).apply {
+                gravity = Gravity.CENTER
+            }
+        }
+
+        stompContainer = FrameLayout(this).apply {
+            val btnSize = 190.dpToPx()
             layoutParams = FrameLayout.LayoutParams(btnSize, btnSize).apply {
                 gravity = Gravity.CENTER
             }
-            background = createRoundedDrawable(colorPanel, 200f) // עיגול פנימי
-            setOnClickListener { handleActionClick() }
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                colors = intArrayOf(Color.parseColor("#1E1E1E"), Color.parseColor("#090909"))
+                gradientType = GradientDrawable.RADIAL_GRADIENT
+                gradientRadius = btnSize.toFloat()
+                setStroke(4.dpToPx(), Color.parseColor("#151515"))
+            }
+            elevation = 20f
         }
 
-        actionLabel = TextView(this).apply {
+        stompLabel = TextView(this).apply {
             text = "INIT"
-            textSize = 20f
-            typeface = Typeface.DEFAULT_BOLD
+            textSize = 18f
+            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+            letterSpacing = 0.15f
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-            )
+            layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
         }
 
-        actionContainer.addView(actionLabel)
-        pedalContainer.addView(ringView)
-        pedalContainer.addView(actionContainer)
-
-        // כפתור איפוס מינימליסטי
-        clearText = TextView(this).apply {
-            text = "CLEAR MEMORY"
-            textSize = 15f
-            typeface = Typeface.DEFAULT_BOLD
-            letterSpacing = 0.1f
-            setTextColor(Color.parseColor("#FF5252"))
-            background = createRoundedDrawable(Color.TRANSPARENT, 8f, Color.parseColor("#4DFF5252"), 1.5f)
-            setPadding(32.dpToPx(), 16.dpToPx(), 32.dpToPx(), 16.dpToPx())
-            setOnClickListener { audioEngine?.clearLoop() }
-            layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT
-            )
+        pedalContainer.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    pedalContainer.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    stopPulsing()
+                    stompContainer.animate().scaleX(0.92f).scaleY(0.92f)
+                        .setDuration(60).setInterpolator(OvershootInterpolator(1.5f)).start()
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    stompContainer.animate().scaleX(1f).scaleY(1f)
+                        .setDuration(120).setInterpolator(OvershootInterpolator(1.5f)).start()
+                    if (event.action == MotionEvent.ACTION_UP) handleActionClick()
+                }
+            }
+            true
         }
 
-        rootLayout.addView(modeText)
-        rootLayout.addView(statusText)
-        rootLayout.addView(bpmText)
+        stompContainer.addView(stompLabel)
+        pedalContainer.addView(rippleEmitter)
+        pedalContainer.addView(cometRing)
+        pedalContainer.addView(stompContainer)
+
+        rootLayout.addView(lcdScreen)
         rootLayout.addView(pedalContainer)
-        rootLayout.addView(clearText)
 
         setContentView(rootLayout)
     }
 
-    private fun cycleDetectionMode() {
-        currentModeIndex = (currentModeIndex + 1) % modes.size
-        modeText.text = modes[currentModeIndex]
+    private fun cycleDetectionMode(direction: Int = 1) {
+        currentModeIndex = (currentModeIndex + direction + modes.size) % modes.size
+        modeText.text = "MODE: ${modes[currentModeIndex]}"
         audioEngine?.setDetectionMode(currentModeIndex)
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == 1 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-            bootEngine()
-        } else {
-            statusText.text = "HARDWARE LOCKED"
-            statusText.setTextColor(colorRecord)
-        }
     }
 
     private fun bootEngine() {
@@ -271,86 +382,155 @@ class MainActivity : AppCompatActivity() {
             audioEngine = AudioEngine()
             audioEngine?.startEngine()
             audioEngine?.setDetectionMode(currentModeIndex)
-            mainHandler.post(telemetryRunnable)
+            // Hook to hardware Vsync
+            Choreographer.getInstance().postFrameCallback(frameCallback)
         } catch (e: Exception) {
-            statusText.text = "KERNEL PANIC"
-            statusText.setTextColor(colorRecord)
+            statusText.text = "ERR: KERNEL"
+            statusText.setTextColor(palette.red)
         }
     }
 
-    private fun updateTelemetry() {
-        audioEngine?.let { engine ->
-            val state = engine.getCurrentState()
-            val bpm = engine.getEstimatedBPM()
+    private fun pollAndRender() {
+        val engine = audioEngine ?: return
 
-            ringView.progress = engine.getLoopPosition()
-            statusText.text = state
-            bpmText.text = if (bpm > 0f) "BPM: ${String.format("%.1f", bpm)}" else "BPM: --"
+        // 1. Poll underlying DSP reality
+        engine.pollTelemetry(telemetryBuffer)
+        val rms = telemetryBuffer[0]
+        val noiseStdDev = telemetryBuffer[1]
+        val transientHit = telemetryBuffer[2] > 0f
 
-            when (state) {
-                "LOOPING" -> {
-                    actionContainer.isEnabled = true
-                    actionLabel.text = "OVERDUB"
-                    actionContainer.background = createRoundedDrawable(Color.parseColor("#092610"), 200f, colorPlay, 2f)
-                    ringView.ringColor = colorPlay
+        val rawState = engine.getCurrentState()
+        val engineState = EngineState.fromString(rawState)
+        val bpm = engine.getEstimatedBPM()
+
+        // 2. Render physical dynamics
+        updateVisualDynamics(rms, noiseStdDev, transientHit)
+
+        // 3. Render logic state
+        cometRing.progress = engine.getLoopPosition()
+
+        if (engineState != lastKnownState) {
+            transitionToState(engineState, rawState)
+            lastKnownState = engineState
+        }
+
+        bpmText.text = if (bpm > 0f) "BPM: ${String.format("%.1f", bpm)}" else "BPM: --"
+    }
+
+    private fun transitionToState(state: EngineState, rawString: String) {
+        statusText.text = rawString
+
+        // Minimalism rule
+        val isActive = state in listOf(EngineState.RECORDING, EngineState.LOOPING, EngineState.OVERDUBBING)
+        val uiAlpha = if (isActive) 0.1f else 1.0f
+        modeText.animate().alpha(uiAlpha).setDuration(400).start()
+        bpmText.animate().alpha(uiAlpha).setDuration(400).start()
+
+        when (state) {
+            EngineState.LOOPING -> {
+                stompLabel.text = "OVERDUB"
+                statusText.setTextColor(palette.green)
+                cometRing.ringColor = palette.green
+                stopPulsing()
+            }
+            EngineState.OVERDUBBING -> {
+                stompLabel.text = "LOCK"
+                statusText.setTextColor(palette.amber)
+                cometRing.ringColor = palette.amber
+                stopPulsing()
+                stompContainer.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_PRESS)
+            }
+            EngineState.RECORDING -> {
+                stompLabel.text = if (currentModeIndex == 1) "TAP STOP" else "REC"
+                statusText.setTextColor(palette.red)
+                cometRing.ringColor = palette.red
+                startPulsing()
+                stompContainer.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_PRESS)
+            }
+            EngineState.PROCESSING -> {
+                stompLabel.text = "SYNC"
+                statusText.setTextColor(Color.WHITE)
+                cometRing.ringColor = Color.WHITE
+                stopPulsing()
+            }
+            EngineState.CALIBRATING -> {
+                stompLabel.text = "WAIT"
+                statusText.setTextColor(Color.parseColor("#555555"))
+                cometRing.ringColor = palette.idle
+                stopPulsing()
+            }
+            EngineState.IDLE, EngineState.UNKNOWN -> {
+                if (currentModeIndex == 1) {
+                    stompLabel.text = "TAP START"
+                    statusText.setTextColor(palette.cyan)
+                    cometRing.ringColor = palette.cyan
+                } else {
+                    stompLabel.text = "PLAY"
+                    statusText.setTextColor(Color.WHITE)
+                    cometRing.ringColor = palette.idle
                 }
-                "OVERDUBBING" -> {
-                    actionContainer.isEnabled = true
-                    actionLabel.text = "LOCK LOOP"
-                    actionContainer.background = createRoundedDrawable(Color.parseColor("#331B00"), 200f, colorOverdub, 2f)
-                    ringView.ringColor = colorOverdub
-                }
-                "RECORDING" -> {
-                    actionContainer.isEnabled = false
-                    actionLabel.text = "RECORDING"
-                    actionContainer.background = createRoundedDrawable(Color.parseColor("#330505"), 200f, colorRecord, 2f)
-                    ringView.ringColor = colorRecord
-                }
-                "PROCESSING" -> {
-                    actionContainer.isEnabled = false
-                    actionLabel.text = "QUANTIZING"
-                    actionContainer.background = createRoundedDrawable(colorPanel, 200f)
-                    ringView.ringColor = Color.WHITE
-                }
-                "CALIBRATING" -> {
-                    actionContainer.isEnabled = false
-                    actionLabel.text = "LEARNING..."
-                    actionContainer.background = createRoundedDrawable(colorPanel, 200f)
-                    ringView.ringColor = Color.parseColor("#333333")
-                }
-                else -> { // IDLE
-                    if (currentModeIndex == 1) { // Tap & Trim
-                        actionContainer.isEnabled = true
-                        actionLabel.text = "TAP START"
-                        actionContainer.background = createRoundedDrawable(Color.parseColor("#00252A"), 200f, colorIdle, 2f)
-                        ringView.ringColor = colorIdle
-                    } else { // Auto Silence / BPM
-                        actionContainer.isEnabled = false
-                        actionLabel.text = "PLAY TO\nSTART"
-                        actionContainer.background = createRoundedDrawable(colorPanel, 200f)
-                        ringView.ringColor = Color.parseColor("#333333")
-                    }
-                }
+                stopPulsing()
             }
         }
     }
 
+    private fun updateVisualDynamics(rms: Float, noiseStdDev: Float, transientHit: Boolean) {
+        val targetAlpha = 0.3f + (rms * 6f).coerceIn(0f, 0.7f)
+        cometRing.alpha = targetAlpha
+
+        val jitterIntensity = noiseStdDev * 300f
+        val targetJitterX = (Math.random().toFloat() - 0.5f) * jitterIntensity
+        val targetJitterY = (Math.random().toFloat() - 0.5f) * jitterIntensity
+
+        currentJitterX += (targetJitterX - currentJitterX) * 0.15f
+        currentJitterY += (targetJitterY - currentJitterY) * 0.15f
+
+        cometRing.translationX = currentJitterX
+        cometRing.translationY = currentJitterY
+
+        if (transientHit) {
+            rippleEmitter.fireRipple(Color.WHITE)
+        }
+    }
+
+    private fun startPulsing() {
+        if (pulseAnimator == null || !pulseAnimator!!.isRunning) {
+            pulseAnimator = ValueAnimator.ofFloat(1f, 1.04f).apply {
+                duration = 600
+                repeatCount = ValueAnimator.INFINITE
+                repeatMode = ValueAnimator.REVERSE
+                interpolator = AccelerateDecelerateInterpolator()
+                addUpdateListener { animator ->
+                    val scale = animator.animatedValue as Float
+                    cometRing.scaleX = scale
+                    cometRing.scaleY = scale
+                }
+                start()
+            }
+        }
+    }
+
+    private fun stopPulsing() {
+        pulseAnimator?.cancel()
+        cometRing.animate().scaleX(1f).scaleY(1f).setDuration(200).start()
+    }
+
     private fun handleActionClick() {
         audioEngine?.let { engine ->
-            val state = engine.getCurrentState()
-            if (state == "LOOPING") {
-                engine.executeOverdub()
-            } else if (state == "OVERDUBBING") {
-                engine.executeLoop()
-            } else if (currentModeIndex == 1 && state == "IDLE") {
-                // מחכה למימוש ב-C++
+            when (EngineState.fromString(engine.getCurrentState())) {
+                EngineState.LOOPING -> engine.executeOverdub()
+                EngineState.OVERDUBBING -> engine.executeLoop()
+                EngineState.IDLE -> if (currentModeIndex == 1) engine.executeRecordStart()
+                EngineState.RECORDING -> if (currentModeIndex == 1) engine.executeRecordStop()
+                else -> {}
             }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        mainHandler.removeCallbacks(telemetryRunnable)
+        pulseAnimator?.cancel()
+        Choreographer.getInstance().removeFrameCallback(frameCallback)
         audioEngine?.stopEngine()
     }
 }
