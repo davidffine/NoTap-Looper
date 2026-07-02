@@ -1,5 +1,6 @@
 #include "../headers/LooperEngine.hpp"
 #include "../includes/kissfft/kiss_fftr.h"
+#include "../headers/miniaudio.h"
 #include <iostream>
 #include <cmath>
 #include <numeric>
@@ -543,4 +544,68 @@ void LooperEngine::process_audio_asynchronously() {
             }
         }
     }
+}
+
+bool LooperEngine::export_to_wav(const char* filepath) {
+    // השגת הווקטור המנוגן כרגע
+    int active_idx = active_playback_idx_.load(std::memory_order_acquire);
+    const auto& active_buffer = playback_buffers_[active_idx];
+
+    if (active_buffer.empty()) {
+        return false;
+    }
+
+    // הגדרת המקודד: WAV, 32-bit Float, Mono, קצב הדגימה של המנוע
+    ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, ma_format_f32, 1, config_.sample_rate);
+    ma_encoder encoder;
+
+    if (ma_encoder_init_file(filepath, &config, &encoder) != MA_SUCCESS) {
+        std::cerr << "[I/O Error] Failed to initialize WAV encoder." << std::endl;
+        return false;
+    }
+
+    // שפיכת הזיכרון לקובץ
+    ma_encoder_write_pcm_frames(&encoder, active_buffer.data(), active_buffer.size(), nullptr);
+    ma_encoder_uninit(&encoder);
+
+    std::cout << "[I/O] Successfully exported loop to: " << filepath << std::endl;
+    return true;
+}
+
+bool LooperEngine::import_from_wav(const char* filepath) {
+    // הגדרת המפענח: אנחנו כופים עליו להמיר כל קובץ אודיו שייכנס לפורמט שהמנוע שלנו מבין
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 1, config_.sample_rate);
+    ma_decoder decoder;
+
+    if (ma_decoder_init_file(filepath, &config, &decoder) != MA_SUCCESS) {
+        std::cerr << "[I/O Error] Failed to load or decode audio file." << std::endl;
+        return false;
+    }
+
+    ma_uint64 frame_count;
+    ma_decoder_get_length_in_pcm_frames(&decoder, &frame_count);
+
+    std::vector<float> loaded_audio(frame_count);
+    ma_uint64 frames_read = 0;
+    ma_decoder_read_pcm_frames(&decoder, loaded_audio.data(), frame_count, &frames_read);
+    ma_decoder_uninit(&decoder);
+
+    if (frames_read == 0) return false;
+    loaded_audio.resize(frames_read); // הידוק הזיכרון במקרה של שגיאת אורך
+
+    // החלת אלגוריתם ה-Crossfade על הקובץ המיובא כדי להבטיח לופ מושלם ללא קליקים דיגיטליים
+    loaded_audio = apply_zero_crossing_crossfade(loaded_audio, 256);
+
+    // --- החלפת מציאות אטומית (Atomic Swap) ---
+    // אנחנו מעתיקים את המידע לחוצץ שכרגע נח, ואז מחליפים את המצביעים באופן Thread-Safe
+    int inactive_idx = 1 - active_playback_idx_.load(std::memory_order_relaxed);
+    playback_buffers_[inactive_idx] = std::move(loaded_audio);
+    playback_read_idx_.store(0, std::memory_order_relaxed);
+    active_playback_idx_.store(inactive_idx, std::memory_order_release);
+
+    // כפיית המכונה למצב נגינה באופן מיידי
+    current_state_.store(LooperState::LOOPING, std::memory_order_release);
+
+    std::cout << "[I/O] Successfully imported loop and injected to DSP." << std::endl;
+    return true;
 }

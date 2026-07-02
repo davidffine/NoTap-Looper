@@ -113,5 +113,27 @@ Java_com_notap_looper_AudioEngine_getCurrentState(JNIEnv *env, jobject thiz) {
     return env->NewStringUTF("UNKNOWN");
 }
 
+JNIEXPORT jboolean JNICALL Java_com_notap_looper_AudioEngine_exportLoopWav(JNIEnv *env, jobject thiz, jstring path) {
+    if (!g_engine) return false;
+    const char *nativeString = env->GetStringUTFChars(path, 0);
+    bool result = g_engine->export_to_wav(nativeString);
+    env->ReleaseStringUTFChars(path, nativeString);
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_notap_looper_AudioEngine_importLoopWav(JNIEnv *env, jobject thiz, jstring path) {
+    if (!g_engine) return false;
+    const char *nativeString = env->GetStringUTFChars(path, 0);
+    bool result = g_engine->import_from_wav(nativeString);
+    env->ReleaseStringUTFChars(path, nativeString);
+    return result;
+}
+
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setTargetBPM(JNIEnv *env, jobject thiz, jfloat bpm) {
+    if (g_engine) {
+        g_engine->set_target_bpm(bpm);
+    }
+}
+
 }
 #endif

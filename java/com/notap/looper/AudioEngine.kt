@@ -25,4 +25,8 @@ class AudioEngine {
     external fun getEstimatedBPM(): Float
     external fun getLoopPosition(): Float
     external fun getCurrentState(): String
+    external fun exportLoopWav(absolutePath: String): Boolean
+    external fun importLoopWav(absolutePath: String): Boolean
+
+    external fun setTargetBPM(bpm: Float)
 }

@@ -47,6 +47,8 @@ private:
     const float SIGMA_MULTIPLIER_ONSET = 8.5f;
     const float SIGMA_MULTIPLIER_SILENCE = 2.0f;
 
+    std::atomic<float> target_bpm_{120.0f};
+
 public:
     DynamicThresholdTracker(int sample_rate, int chunk_size, float tracking_window_seconds = 1.0f);
     void observe_background_noise(float chunk_rms);
@@ -56,6 +58,7 @@ public:
     float get_silence_threshold() const;
     float get_mean() const;
     float get_std_dev() const { return current_std_dev_; }
+    void set_target_bpm(float bpm) { target_bpm_.store(bpm, std::memory_order_relaxed); }
 };
 
 class LooperEngine {
@@ -66,6 +69,7 @@ private:
     std::atomic<LooperState> current_state_{LooperState::CALIBRATING};
     std::atomic<bool> is_running_{true};
     std::thread worker_thread_;
+    std::atomic<float> target_bpm_{120.0f};
 
     DynamicThresholdTracker noise_tracker_;
 
@@ -116,9 +120,16 @@ public:
     float get_estimated_bpm() const;
     float get_loop_position() const;
 
+    bool export_to_wav(const char* filepath);
+    bool import_from_wav(const char* filepath);
+
     void update_hardware_latency(float latency_seconds);
 
     void on_audio_callback(const float* input_data, size_t num_frames);
     void process_output_callback(float* output_data, size_t num_frames);
     LooperState get_current_state() const;
+
+    void set_target_bpm(float bpm) {
+        target_bpm_.store(bpm, std::memory_order_relaxed);
+    }
 };
