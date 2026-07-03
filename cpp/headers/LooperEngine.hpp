@@ -44,8 +44,8 @@ private:
     float current_mean_ = 0.0f;
     float current_std_dev_ = 0.0f;
 
-    const float SIGMA_MULTIPLIER_ONSET = 8.5f;
-    const float SIGMA_MULTIPLIER_SILENCE = 2.0f;
+    float SIGMA_MULTIPLIER_ONSET = 12.0f;
+    float SIGMA_MULTIPLIER_SILENCE = 2.0f;
 
     std::atomic<float> target_bpm_{120.0f};
 
@@ -59,6 +59,8 @@ public:
     float get_mean() const;
     float get_std_dev() const { return current_std_dev_; }
     void set_target_bpm(float bpm) { target_bpm_.store(bpm, std::memory_order_relaxed); }
+    void set_sigma_onset(float val) { SIGMA_MULTIPLIER_ONSET = val; }
+    void set_sigma_silence(float val) { SIGMA_MULTIPLIER_SILENCE = val; }
 };
 
 class LooperEngine {
@@ -91,7 +93,7 @@ private:
     // [חדש] שמירת אונטולוגיית הזיהוי (0=Auto, 1=Tap, 2=BPM)
     std::atomic<int> detection_mode_{0};
 
-    const float ABSOLUTE_MIN_ONSET_RMS = 0.015f;
+    float ABSOLUTE_MIN_ONSET_RMS = 0.002f;
 
     float calculate_rms(const std::vector<float>& chunk);
     size_t find_true_onset(const std::vector<float>& audio_data, size_t max_search_samples, float threshold);
@@ -101,9 +103,18 @@ private:
     std::vector<float> apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples = 256);
     void process_audio_asynchronously();
 
+    // [חדש] מנגנון סינון תדרים לטריגר בלבד
+    float pre_emphasis_state_{0.0f};
+    float calculate_trigger_rms(const std::vector<float>& chunk);
+
+    // [חדש] מנגנון רצף קצר (היסטרזיס)
+    int onset_persistence_target_{4};
+    int current_onset_streak_{0};
+
 public:
     explicit LooperEngine(EngineConfig config = EngineConfig{});
     ~LooperEngine();
+
 
     std::atomic<float> current_rms_{0.0f};
     std::atomic<float> current_noise_std_dev_{0.0f};
@@ -116,6 +127,11 @@ public:
     void execute_record_start_command();
     void execute_record_stop_command();
     void set_detection_mode(int mode);
+
+    void set_onset_persistence(int chunks) { onset_persistence_target_ = chunks; }
+
+    void set_min_onset_rms(float val) { ABSOLUTE_MIN_ONSET_RMS = val; }
+    DynamicThresholdTracker& get_noise_tracker() { return noise_tracker_; }
 
     float get_estimated_bpm() const;
     float get_loop_position() const;
