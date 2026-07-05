@@ -3,6 +3,7 @@
 #include "../headers/miniaudio.h"
 #include <iostream>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
 #include <algorithm>
 
@@ -10,6 +11,26 @@
 #include <xmmintrin.h>
 #include <pmmintrin.h>
 #endif
+
+// FTZ/DAZ הם מצב של רגיסטר ה-FP *של ה-Thread הנוכחי*.
+// חייבים להיקרא מתוך ה-Worker עצמו — קריאה מה-Constructor מגינה על ה-Thread הלא נכון.
+// באנדרואיד האמיתי (ARM) הענף של x86 לא מתקמפל כלל, ולכן חובה ענף FPCR/FPSCR ייעודי.
+static void enable_denormal_flush_to_zero() {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+#elif defined(__aarch64__)
+    uint64_t fpcr;
+    __asm__ __volatile__("mrs %0, fpcr" : "=r"(fpcr));
+    fpcr |= (1ULL << 24);   // FZ: Flush-to-Zero
+    __asm__ __volatile__("msr fpcr, %0" : : "r"(fpcr));
+#elif defined(__arm__)
+    uint32_t fpscr;
+    __asm__ __volatile__("vmrs %0, fpscr" : "=r"(fpscr));
+    fpscr |= (1u << 24);    // FZ: Flush-to-Zero
+    __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
+#endif
+}
 
 std::string state_to_string(LooperState state) {
     switch (state) {
@@ -24,9 +45,17 @@ std::string state_to_string(LooperState state) {
 }
 
 DynamicThresholdTracker::DynamicThresholdTracker(int sample_rate, int chunk_size, float tracking_window_seconds) {
+    reconfigure(sample_rate, chunk_size, tracking_window_seconds);
+}
+
+void DynamicThresholdTracker::reconfigure(int sample_rate, int chunk_size, float tracking_window_seconds) {
     history_capacity_ = static_cast<size_t>(sample_rate * tracking_window_seconds) / chunk_size;
     if (history_capacity_ < 10) history_capacity_ = 10;
-    noise_history_.resize(history_capacity_, 0.0f);
+    noise_history_.assign(history_capacity_, 0.0f);
+    write_idx_ = 0;
+    is_buffer_full_ = false;
+    current_mean_ = 0.0f;
+    current_std_dev_ = 0.0f;
 }
 
 void DynamicThresholdTracker::observe_background_noise(float chunk_rms) {
@@ -55,20 +84,20 @@ void DynamicThresholdTracker::recalculate_statistics() {
 }
 
 bool DynamicThresholdTracker::is_ready() const { return is_buffer_full_ || write_idx_ > (history_capacity_ / 2); }
-float DynamicThresholdTracker::get_onset_threshold() const { return current_mean_ + (SIGMA_MULTIPLIER_ONSET * current_std_dev_); }
-float DynamicThresholdTracker::get_silence_threshold() const { return current_mean_ + (SIGMA_MULTIPLIER_SILENCE * current_std_dev_); }
+float DynamicThresholdTracker::get_onset_threshold() const {
+    return current_mean_ + (sigma_multiplier_onset_.load(std::memory_order_relaxed) * current_std_dev_);
+}
+float DynamicThresholdTracker::get_silence_threshold() const {
+    return current_mean_ + (sigma_multiplier_silence_.load(std::memory_order_relaxed) * current_std_dev_);
+}
 float DynamicThresholdTracker::get_mean() const { return current_mean_; }
 
 LooperEngine::LooperEngine(EngineConfig config) :
         config_(config),
         input_queue_(config.sample_rate * 5),
-        noise_tracker_(config.sample_rate, config.chunk_size, 1.0f)
+        noise_tracker_(config.sample_rate, config.chunk_size, 1.0f),
+        raw_noise_tracker_(config.sample_rate, config.chunk_size, 1.0f)
 {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
-    _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
-#endif
-
     worker_thread_ = std::thread(&LooperEngine::process_audio_asynchronously, this);
 }
 
@@ -92,6 +121,8 @@ float LooperEngine::get_estimated_bpm() const {
 }
 
 float LooperEngine::get_loop_position() const {
+    // נעילה קצרה מול ה-Worker: מונעת קריאת size() של וקטור שנמצא באמצע move/assign
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
     int active_idx = active_playback_idx_.load(std::memory_order_acquire);
     const auto& active_buffer = playback_buffers_[active_idx];
     size_t buffer_size = active_buffer.size();
@@ -102,11 +133,11 @@ float LooperEngine::get_loop_position() const {
     return static_cast<float>(current_idx) / static_cast<float>(buffer_size);
 }
 
-void LooperEngine::update_hardware_latency(float latency_seconds) {
-    config_.preroll_seconds = latency_seconds + 0.02f;
-    size_t new_max_samples = static_cast<size_t>(config_.preroll_seconds * config_.sample_rate);
-    preroll_buffer_.resize(new_max_samples, 0.0f);
-    std::cout << "[DSP] Dynamic Preroll calibrated to: " << config_.preroll_seconds << "s based on Hardware." << std::endl;
+void LooperEngine::update_hardware_config(int sample_rate, float latency_seconds) {
+    // רישום בלבד — ה-Worker מחיל את השינוי בבטחה בתחילת האיטרציה שלו.
+    // שינוי ישיר של config_ או resize של preroll_buffer_ מכאן הוא Data Race.
+    if (sample_rate > 0) pending_sample_rate_.store(sample_rate, std::memory_order_relaxed);
+    pending_preroll_seconds_.store(latency_seconds + 0.02f, std::memory_order_relaxed);
 }
 
 void LooperEngine::on_audio_callback(const float* input_data, size_t num_frames) {
@@ -121,6 +152,10 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
     }
 
     int active_idx = active_playback_idx_.load(std::memory_order_acquire);
+    // איתות Grace: ה-Worker רשאי לכתוב לחוצץ הלא-פעיל רק אחרי שנצפינו כאן על הפעיל.
+    // הקולבקים של Oboe סדרתיים, ולכן צפייה על אינדקס חדש מוכיחה שהקריאה הקודמת הסתיימה.
+    reader_observed_idx_.store(active_idx, std::memory_order_release);
+
     const auto& active_buffer = playback_buffers_[active_idx];
 
     if (active_buffer.empty()) {
@@ -128,8 +163,10 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
         return;
     }
 
-    size_t current_idx = playback_read_idx_.load(std::memory_order_relaxed);
     size_t buffer_size = active_buffer.size();
+    size_t current_idx = playback_read_idx_.load(std::memory_order_relaxed);
+    // הגנה מפני אינדקס ישן שנשאר מלופ ארוך יותר — קריאה מעבר לגבול היא UB
+    if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
 
     for (size_t i = 0; i < num_frames; ++i) {
         output_data[i] = active_buffer[current_idx];
@@ -186,12 +223,18 @@ std::vector<float> LooperEngine::extract_novelty_curve(const std::vector<float>&
 
     std::vector<float> prev_magnitudes(NFFT / 2 + 1, 0.0f);
 
+    // חישוב חלון Hann פעם אחת מראש במקום cos() לכל דגימה בכל חלון
+    const float PI_F = 3.14159265358979323846f;
+    std::vector<float> hann_window(NFFT);
+    for (int j = 0; j < NFFT; ++j) {
+        hann_window[j] = 0.5f * (1.0f - std::cos(2.0f * PI_F * j / (NFFT - 1)));
+    }
+
     // מעבר על האודיו בחלונות קופצים
     for (size_t i = 0; i + NFFT <= audio_data.size(); i += HOP_SIZE) {
         // 1. החלת חלון (Hann Window) למניעת זליגת תדרים בקצוות
         for (int j = 0; j < NFFT; ++j) {
-            float hann_multiplier = 0.5f * (1.0f - std::cos(2.0f * M_PI * j / (NFFT - 1)));
-            time_in[j] = audio_data[i + j] * hann_multiplier;
+            time_in[j] = audio_data[i + j] * hann_window[j];
         }
 
         // 2. ביצוע התמרת פורייה
@@ -243,79 +286,99 @@ float LooperEngine::quantize_to_musical_phrase(float raw_beats) {
     return best_match;
 }
 
-float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& audio_data) {
-    std::cout << "[DSP] Running Energy-Weighted Transient Histogram Analysis (KissFFT)..." << std::endl;
+// אומדן אורך פעימה באוטוקורלציה של עקומת ה-Novelty.
+// מחליף את היסטוגרמת הזוגות הדלילה: האוטוקורלציה משתמשת בעקומה *כולה*
+// (חסינה לפספוס/עודף פיקים), ההצבעה ההרמונית פותרת את דו-המשמעות האוקטבית
+// (פעימה מול חצי/כפל פעימה), ואינטרפולציה פרבולית נותנת רזולוציה תת-צ'אנקית
+// (הצ'אנק לבדו = ±1.4% שגיאת טמפו שמצטברת לשניות בלופים ארוכים).
+float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples) {
+    const float fallback = (60.0f / 120.0f) * config_.sample_rate;
+    auto give_up = [&]() { estimated_bpm_.store(120.0f, std::memory_order_relaxed); return fallback; };
 
-    if (audio_data.size() < static_cast<size_t>(config_.sample_rate)) {
-        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
-        return (60.0f / 120.0f) * config_.sample_rate;
-    }
+    if (analysis_samples > audio_data.size()) analysis_samples = audio_data.size();
+    if (analysis_samples < static_cast<size_t>(config_.sample_rate)) return give_up();
 
-    int chunk_size = 0;
-    // הפקת עקומת הטרנזיינטים ממרחב התדר (Frequency-Domain)
-    std::vector<float> novelty = extract_novelty_curve(audio_data, 0, chunk_size);
+    // Novelty רק על הקטע המוזיקלי (זנב הד/שקט מדלל את הקורלציה)
+    std::vector<float> segment(audio_data.begin(), audio_data.begin() + analysis_samples);
+    int hop = 0;
+    std::vector<float> novelty = extract_novelty_curve(segment, 0, hop);
+    if (hop == 0 || novelty.size() < 32) return give_up();
+    const int N = static_cast<int>(novelty.size());
 
-    if (novelty.empty() || chunk_size == 0) {
-        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
-        return (60.0f / 120.0f) * config_.sample_rate;
-    }
-
-    float mean_nov = std::accumulate(novelty.begin(), novelty.end(), 0.0f) / novelty.size();
-    float peak_threshold = mean_nov * 1.5f;
-
-    struct TransientEvent { int index; float energy; };
-    std::vector<TransientEvent> transients;
-
-    // זיהוי חתימות תדר חזקות (Peaks) בעקומת הספקטרום
-    for (size_t i = 1; i < novelty.size() - 1; ++i) {
-        if (novelty[i] > peak_threshold && novelty[i] > novelty[i - 1] && novelty[i] > novelty[i + 1]) {
-            // חסם מינימלי בין פעימות למניעת זיהוי כפול
-            if (transients.empty() || (static_cast<int>(i) - transients.back().index) > 2) {
-                transients.push_back({static_cast<int>(i), novelty[i]});
-            }
+    // הסרת מגמה איטית (ממוצע-נע ~0.5s): משאירה את מבנה הפעימות בלבד,
+    // בלי שהמעטפת האיטית של הביצוע תזלוג לאוטוקורלציה.
+    float env_sr = static_cast<float>(config_.sample_rate) / hop;
+    int trend_win = std::max(4, static_cast<int>(env_sr * 0.5f));
+    std::vector<float> detrended(N);
+    {
+        double running = 0.0;
+        std::vector<double> prefix(N + 1, 0.0);
+        for (int i = 0; i < N; ++i) { running += novelty[i]; prefix[i + 1] = running; }
+        for (int i = 0; i < N; ++i) {
+            int lo = std::max(0, i - trend_win / 2);
+            int hi = std::min(N, i + trend_win / 2 + 1);
+            detrended[i] = novelty[i] - static_cast<float>((prefix[hi] - prefix[lo]) / (hi - lo));
         }
     }
 
-    if (transients.size() < 2) {
-        estimated_bpm_.store(120.0f, std::memory_order_relaxed);
-        return (60.0f / 120.0f) * config_.sample_rate;
+    // טווח החיפוש: 240 עד 45 BPM, מורחב ×2 לצורך ההצבעה ההרמונית
+    int min_lag = std::max(2, static_cast<int>(std::floor((60.0f / 240.0f) * env_sr)));
+    int max_lag = static_cast<int>(std::ceil((60.0f / 45.0f) * env_sr));
+    int ext_lag = std::min(2 * max_lag + 1, N - 2);
+    if (max_lag > ext_lag) max_lag = ext_lag;
+    if (max_lag <= min_lag + 2) return give_up();
+
+    // אוטוקורלציה מנורמלת ולא-מוטה (חלוקה ב-N-lag)
+    double ac0 = 0.0;
+    for (int i = 0; i < N; ++i) ac0 += static_cast<double>(detrended[i]) * detrended[i];
+    ac0 /= N;
+    if (ac0 < 1e-12) return give_up();
+    std::vector<float> ac(ext_lag + 1, 0.0f);
+    for (int lag = min_lag; lag <= ext_lag; ++lag) {
+        double sum = 0.0;
+        for (int i = 0; i + lag < N; ++i) sum += static_cast<double>(detrended[i]) * detrended[i + lag];
+        ac[lag] = static_cast<float>((sum / (N - lag)) / ac0);
     }
 
-    // קצב הדגימה החדש של עקומת ה-novelty
-    int env_sr = config_.sample_rate / chunk_size;
-    int min_lag_chunks = static_cast<int>((60.0f / 240.0f) * env_sr);
-    int max_lag_chunks = static_cast<int>((60.0f / 45.0f) * env_sr);
+    auto ac_at = [&](float lag) -> float {
+        if (lag < min_lag || lag > ext_lag - 1) return 0.0f;
+        int i = static_cast<int>(lag);
+        float frac = lag - i;
+        return ac[i] * (1.0f - frac) + ac[i + 1] * frac;
+    };
 
-    std::vector<float> energy_histogram(max_lag_chunks + 1, 0.0f);
+    // בחירת המועמד: מקסימום מקומי בטווח הבסיסי, עם חיזוק הרמוני —
+    // פעימה אמיתית נתמכת גם על ידי הכפולות שלה (2L, 3L).
+    int best = -1;
+    float best_score = -1e9f;
+    for (int lag = min_lag + 1; lag < max_lag; ++lag) {
+        if (ac[lag] <= ac[lag - 1] || ac[lag] < ac[lag + 1]) continue;   // לא פיק
+        float score = ac[lag] + 0.5f * ac_at(2.0f * lag) + 0.25f * ac_at(3.0f * lag);
+        if (score > best_score) { best_score = score; best = lag; }
+    }
+    if (best < 0) return give_up();
 
-    // מילוי ההיסטוגרמה
-    for (size_t i = 0; i < transients.size(); ++i) {
-        for (size_t j = i + 1; j < transients.size(); ++j) {
-            int lag = transients[j].index - transients[i].index;
-            if (lag >= min_lag_chunks && lag <= max_lag_chunks) {
-                float weight = transients[i].energy * transients[j].energy;
-                energy_histogram[lag] += weight;
-                // פיזור קל לריכוך חוסר-דיוק אנושי בנגינה
-                if (lag > min_lag_chunks) energy_histogram[lag - 1] += weight * 0.5f;
-                if (lag < max_lag_chunks) energy_histogram[lag + 1] += weight * 0.5f;
-            }
+    // עידון פרבולי סביב הפיק — רזולוציה תת-צ'אנקית
+    float refined = static_cast<float>(best);
+    {
+        float y0 = ac[best - 1], y1 = ac[best], y2 = ac[best + 1];
+        float denom = y0 - 2.0f * y1 + y2;
+        if (std::abs(denom) > 1e-12f) {
+            float delta = 0.5f * (y0 - y2) / denom;
+            if (delta > -0.5f && delta < 0.5f) refined += delta;
         }
     }
 
-    int best_lag_chunks = min_lag_chunks;
-    float max_energy = -1.0f;
-    for (int lag = min_lag_chunks; lag <= max_lag_chunks; ++lag) {
-        if (energy_histogram[lag] > max_energy) {
-            max_energy = energy_histogram[lag];
-            best_lag_chunks = lag;
-        }
+    // ירידה לרשת העדינה (Tatum) כשהיא חזקה באמת: יחידה עדינה מקסימלית מבטיחה
+    // שכל אורך-פרייז שלם ניתן לייצוג (7 פעימות אינו כפולה של פעימה-כפולה).
+    while (refined / 2.0f >= min_lag && ac_at(refined / 2.0f) >= 0.8f * ac_at(refined)) {
+        refined /= 2.0f;
     }
 
-    float refined_beat_samples = static_cast<float>(best_lag_chunks) * chunk_size;
-    float calculated_bpm = 60.0f / (refined_beat_samples / config_.sample_rate);
+    float beat_samples = refined * hop;
+    float calculated_bpm = 60.0f / (beat_samples / config_.sample_rate);
     estimated_bpm_.store(calculated_bpm, std::memory_order_relaxed);
-
-    return refined_beat_samples;
+    return beat_samples;
 }
 
 void LooperEngine::execute_record_start_command() {
@@ -346,62 +409,241 @@ std::vector<float> LooperEngine::apply_zero_crossing_crossfade(std::vector<float
 }
 
 void LooperEngine::process_audio_asynchronously() {
+    // הגנת דנורמלים — חייבת לרוץ על ה-Thread הזה עצמו
+    enable_denormal_flush_to_zero();
+
     std::vector<float> local_chunk;
     local_chunk.reserve(config_.chunk_size);
-    size_t max_preroll_samples = static_cast<size_t>(config_.preroll_seconds * config_.sample_rate);
-    preroll_buffer_.resize(max_preroll_samples, 0.0f);
+
+    // ה-Preroll חייב לכסות את *חלון ההחלטה*: אנו מחליטים רק אחרי persistence
+    // חלונות תהודה, כלומר ההקלטה מתחילה ~75ms אחרי ההתקף. אם ה-Preroll קצר
+    // מכך (במכשיר לייטנסי החומרה הוא ~28ms בלבד), ההתקף עצמו יאבד. לכן
+    // מרצפים את ה-Preroll ל-max(לייטנסי-חומרה, חלון-ההחלטה + מרווח).
+    auto compute_preroll_samples = [&]() -> size_t {
+        size_t from_latency = static_cast<size_t>(config_.preroll_seconds * config_.sample_rate);
+        size_t decision_cover = static_cast<size_t>(
+            onset_persistence_target_.load(std::memory_order_relaxed) + 3) * config_.chunk_size;
+        size_t s = std::max(from_latency, decision_cover);
+        return s < 1 ? 1 : s;
+    };
+    size_t max_preroll_samples = compute_preroll_samples();
+    preroll_buffer_.assign(max_preroll_samples, 0.0f);
     preroll_write_idx_ = 0;
+
     std::vector<float> recorded_audio;
     recorded_audio.reserve(config_.sample_rate * 60);
-    float peak_recording_rms = 0.0f;
-    size_t silence_samples_count = 0;
+
+    // סקראץ' אוברדאב פרטי ל-Worker: כל המיקסים קורים כאן,
+    // והתוצאה מתפרסמת לחוצץ הכפול פעם בכל השלמת סיבוב לופ.
+    std::vector<float> overdub_scratch;
+    size_t overdub_idx = 0;
+    bool overdub_publish_pending = false;
+
+    // מעטפת פיק דועכת — נשמרת לטלמטריה ולאבחון בלבד (סף השקט כבר לא תלוי בה)
+    float peak_envelope = 0.0f;
+    float env_release_coef = 1.0f;
+    size_t max_record_samples = 0;
+    size_t silence_samples_count = 0;      // מסלול א': שקט מוחלט רצוף
+    size_t inactivity_count = 0;           // מסלול ב': זמן מאז שהפעילות המוזיקלית פסקה
+    size_t trailing_non_musical_samples = 0; // הזנב הלא-מוזיקלי בעת סגירה (לקוונטיזציה)
+    size_t last_published_loop_samples = 0;  // אורך הלופ שפורסם (לטלמטריה בלבד)
+    float session_peak_raw = 0.0f;           // שיא ה-raw של ההקלטה הנוכחית (רצפת פעילות יחסית)
+    float prev_trigger_volume = 0.0f;
+    int publish_defer_count = 0;
+    int buffer_release_countdown = 0;
+    uint64_t total_samples_processed = 0;   // שעון-דגימות דטרמיניסטי לטלמטריה
     float sample;
-    float prev_volume = 0.0f;
+
+    const float ENV_RELEASE_SECONDS = 1.5f;   // קבוע הזמן של שחרור המעטפת (טלמטריה)
+    const float MAX_RECORD_SECONDS = 300.0f;  // רשת ביטחון נגד הקלטה אינסופית
+
+    // --- Spectral Flux זורם (novelty בזמן-אמת) ---
+    // רץ על ה-Worker (לא על ה-Thread של Oboe), ולכן הקצאת KissFFT מותרת.
+    // חלון 1024 עם hop של צ'אנק בודד; Flux = סכום ההפרשים החיוביים במגניטודה
+    // מול המסגרת הקודמת (Half-wave rectified). מזהה תו חדש לפי *חידוש ספקטרלי*
+    // ולא לפי אנרגיה גולמית — לכן רגיש לפריטת מיתר E דק גם ברמה נמוכה.
+    const int FLUX_NFFT = 1024;
+    const float PI_F = 3.14159265358979323846f;
+    kiss_fftr_cfg flux_cfg = kiss_fftr_alloc(FLUX_NFFT, 0, nullptr, nullptr);
+    std::vector<kiss_fft_scalar> flux_time_in(FLUX_NFFT, 0.0f);
+    std::vector<kiss_fft_cpx> flux_freq_out(FLUX_NFFT / 2 + 1);
+    std::vector<float> flux_prev_mag(FLUX_NFFT / 2 + 1, 0.0f);
+    std::vector<float> flux_window(FLUX_NFFT);
+    for (int j = 0; j < FLUX_NFFT; ++j)
+        flux_window[j] = 0.5f * (1.0f - std::cos(2.0f * PI_F * j / (FLUX_NFFT - 1)));
+    std::vector<float> flux_ring(FLUX_NFFT, 0.0f);   // חלון גולל של NFFT הדגימות האחרונות
+
+    auto compute_flux = [&](const std::vector<float>& chunk) -> float {
+        // דחיפת הצ'אנק החדש ושמירת NFFT הדגימות האחרונות
+        flux_ring.insert(flux_ring.end(), chunk.begin(), chunk.end());
+        if (flux_ring.size() > static_cast<size_t>(FLUX_NFFT))
+            flux_ring.erase(flux_ring.begin(), flux_ring.end() - FLUX_NFFT);
+        for (int j = 0; j < FLUX_NFFT; ++j) flux_time_in[j] = flux_ring[j] * flux_window[j];
+        kiss_fftr(flux_cfg, flux_time_in.data(), flux_freq_out.data());
+        float flux = 0.0f;
+        for (int k = 0; k <= FLUX_NFFT / 2; ++k) {
+            float mag = std::sqrt(flux_freq_out[k].r * flux_freq_out[k].r +
+                                  flux_freq_out[k].i * flux_freq_out[k].i);
+            float diff = mag - flux_prev_mag[k];
+            if (diff > 0.0f) flux += diff;      // Half-wave rectification
+            flux_prev_mag[k] = mag;
+        }
+        return flux;
+    };
+
+    // סף Flux אדפטיבי: חציון + k·MAD על היסטוריית ה-Flux האחרונה (חסין לספייקים).
+    std::vector<float> flux_hist(64, 0.0f);
+    size_t flux_hist_idx = 0;
+    float current_flux = 0.0f;
+    float current_flux_threshold = 0.0f;
+
+    auto recompute_time_constants = [&]() {
+        float chunk_seconds = static_cast<float>(config_.chunk_size) / static_cast<float>(config_.sample_rate);
+        env_release_coef = std::exp(-chunk_seconds / ENV_RELEASE_SECONDS);
+        max_record_samples = static_cast<size_t>(MAX_RECORD_SECONDS * config_.sample_rate);
+    };
+    recompute_time_constants();
+
+    // מותר לכתוב לחוצץ נגינה רק כשהקורא לא יכול להיות בתוכו:
+    // או שאין נגינה כלל, או שהקורא נצפה לאחרונה על החוצץ *השני*.
+    // מונה הדחיות חוסם המתנה אינסופית אם זרם הרמקול נתקע (ואז ממילא אין Race).
+    auto acquire_writable_slot = [&]() -> int {
+        int active = active_playback_idx_.load(std::memory_order_relaxed);
+        LooperState s = current_state_.load(std::memory_order_relaxed);
+        bool reader_running = (s == LooperState::LOOPING || s == LooperState::OVERDUBBING);
+        if (!reader_running ||
+            reader_observed_idx_.load(std::memory_order_acquire) == active ||
+            ++publish_defer_count > 32) {
+            publish_defer_count = 0;
+            return 1 - active;
+        }
+        return -1;
+    };
 
     while (is_running_.load(std::memory_order_relaxed)) {
 
+        // --- החלת בקשות קונפיגורציית חומרה (נרשמות מ-Threads אחרים, מוחלות רק כאן) ---
+        int new_sr = pending_sample_rate_.exchange(-1, std::memory_order_relaxed);
+        float new_preroll = pending_preroll_seconds_.exchange(-1.0f, std::memory_order_relaxed);
+        if (new_sr > 0 && new_sr != config_.sample_rate) {
+            config_.sample_rate = new_sr;
+            noise_tracker_.reconfigure(new_sr, config_.chunk_size, 1.0f);
+            raw_noise_tracker_.reconfigure(new_sr, config_.chunk_size, 1.0f);
+            recompute_time_constants();
+            // קצב דגימה חדש מבטל את תוקף הסטטיסטיקה — לומדים את החדר מחדש
+            LooperState s = current_state_.load(std::memory_order_relaxed);
+            if (s == LooperState::CALIBRATING || s == LooperState::IDLE) {
+                current_state_.store(LooperState::CALIBRATING, std::memory_order_release);
+            }
+            if (new_preroll <= 0.0f) new_preroll = config_.preroll_seconds; // חישוב מחדש של ה-Preroll בקצב החדש
+            std::cout << "[DSP] Engine reconfigured to hardware sample rate: " << new_sr << std::endl;
+        }
+        if (new_preroll > 0.0f) {
+            config_.preroll_seconds = new_preroll;
+            max_preroll_samples = compute_preroll_samples();
+            preroll_buffer_.assign(max_preroll_samples, 0.0f);
+            preroll_write_idx_ = 0;
+            std::cout << "[DSP] Dynamic Preroll calibrated to: "
+                      << (static_cast<float>(max_preroll_samples) / config_.sample_rate)
+                      << "s (hw " << config_.preroll_seconds << "s + decision window)." << std::endl;
+        }
+
+        // --- מסירת לופ מיובא (פוענח על JNI, מתפרסם רק כאן) ---
+        if (has_pending_import_.load(std::memory_order_acquire)) {
+            int slot = acquire_writable_slot();
+            if (slot >= 0) {
+                {
+                    std::lock_guard<std::mutex> lock(buffer_mutex_);
+                    playback_buffers_[slot] = std::move(pending_import_);
+                    pending_import_.clear();
+                }
+                has_pending_import_.store(false, std::memory_order_release);
+                playback_read_idx_.store(0, std::memory_order_relaxed);
+                active_playback_idx_.store(slot, std::memory_order_release);
+                current_state_.store(LooperState::LOOPING, std::memory_order_release);
+                std::cout << "[I/O] Imported loop injected to DSP." << std::endl;
+            }
+            // slot == -1: הקורא עוד לא נצפה — ננסה שוב באיטרציה הבאה
+        }
+
         if (request_clear_.exchange(false, std::memory_order_relaxed)) {
             recorded_audio.clear();
-            playback_buffers_[0].clear();
-            playback_buffers_[1].clear();
-            active_playback_idx_.store(0, std::memory_order_release);
-            playback_read_idx_.store(0, std::memory_order_relaxed);
+            overdub_scratch.clear();
+            overdub_publish_pending = false;
+            current_onset_streak_ = 0;
             silence_samples_count = 0;
-            peak_recording_rms = 0.0f;
-            current_state_.store(LooperState::IDLE, std::memory_order_release);
+            inactivity_count = 0;
+            trailing_non_musical_samples = 0;
+            session_peak_raw = 0.0f;
+            peak_envelope = 0.0f;
+            prev_trigger_volume = 0.0f;
             estimated_bpm_.store(0.0f, std::memory_order_relaxed);
+            // קודם עוצרים את הקורא (מעבר ל-IDLE), ומשחררים את החוצצים רק אחרי
+            // תקופת חסד בזמן-אמת — כדי שקולבק שנמצא באמצע קריאה לא יישמט מתחתיו.
+            current_state_.store(LooperState::IDLE, std::memory_order_release);
+            buffer_release_countdown = 8;   // 8 צ'אנקים ≈ 85ms של זמן אמת
             continue;
         }
 
-        local_chunk.clear();
+        // צבירה לגודל צ'אנק *קבוע*: הצ'אנק הוא יחידת ההחלטה הסטטיסטית של המנוע.
+        // עיבוד צ'אנקים חלקיים (כפי שקרה קודם) הופך את היחידה לתלוית-תזמון:
+        // Oboe מוסר Bursts של ~96–192 פריימים, כך שה-RMS, ה-σ והמשמעות של
+        // persistence היו משתנים עם גודל ה-Burst — וכל כוונון במעבדה (צ'אנקים
+        // של 512) היה מפסיק להיות תקף במכשיר. local_chunk נשמר בין איטרציות
+        // עד שמתמלא במלואו; שום דגימה לא אובדת.
         while (local_chunk.size() < static_cast<size_t>(config_.chunk_size) && input_queue_.pop(sample)) {
             local_chunk.push_back(sample);
         }
 
-        if (local_chunk.empty()) { std::this_thread::yield(); continue; }
+        if (local_chunk.size() < static_cast<size_t>(config_.chunk_size)) { std::this_thread::yield(); continue; }
+        total_samples_processed += local_chunk.size();
 
-        float volume = calculate_rms(local_chunk);
-        current_rms_.store(volume, std::memory_order_relaxed);
-        current_noise_std_dev_.store(noise_tracker_.get_std_dev(), std::memory_order_relaxed);
-
-        if (volume > noise_tracker_.get_onset_threshold() && volume > prev_volume * 1.5f) {
-            transient_hit_flag_.store(true, std::memory_order_relaxed);
+        // שחרור דחוי של חוצצי הנגינה אחרי Clear (נספר בצ'אנקים == זמן אמת)
+        if (buffer_release_countdown > 0 && --buffer_release_countdown == 0) {
+            std::lock_guard<std::mutex> lock(buffer_mutex_);
+            playback_buffers_[0].clear();
+            playback_buffers_[1].clear();
+            playback_read_idx_.store(0, std::memory_order_relaxed);
         }
 
-        prev_volume = volume;
+        // חישוב כפול: עוצמה פיזית גולמית (להקלטה ולתצוגה), ועוצמה מסוננת (להחלטה אלגוריתמית)
+        float raw_volume = calculate_rms(local_chunk);
+        float trigger_volume = calculate_trigger_rms(local_chunk);
+
+        // Spectral Flux זורם — כלי מדידה אופליין בלבד. המדידה הוכיחה שה-Flux
+        // *אינו* מבחין נקי (טרנזיינט AC/נקישה מייצר Flux בגובה פריטה רכה, וה-Flux
+        // גדל עם עוצמה), ולכן איננו מזהה ההתקף הראשי. מחשבים אותו רק כשה-Sink פעיל
+        // כדי לא לשלם FFT לכל צ'אנק במכשיר לחינם.
+        bool telemetry_active = (telemetry_sink_.load(std::memory_order_relaxed) != nullptr);
+        if (telemetry_active) {
+            current_flux = compute_flux(local_chunk);
+            std::vector<float> sorted(flux_hist);
+            std::sort(sorted.begin(), sorted.end());
+            float median = sorted[sorted.size() / 2];
+            float mad_sum = 0.0f;
+            for (float v : sorted) mad_sum += std::abs(v - median);
+            float mad = mad_sum / sorted.size();
+            current_flux_threshold = median + 4.0f * mad;
+        }
+
+        current_rms_.store(raw_volume, std::memory_order_relaxed);
+        current_noise_std_dev_.store(noise_tracker_.get_std_dev(), std::memory_order_relaxed);
 
         LooperState state = current_state_.load(std::memory_order_relaxed);
 
         switch (state) {
             case LooperState::CALIBRATING: {
-                noise_tracker_.observe_background_noise(volume);
-                if (noise_tracker_.is_ready()) {
+                // המערכת לומדת את רעש הרקע בשני המרחבים: המסונן (להתקף) והגולמי (לתהודה ושקט)
+                noise_tracker_.observe_background_noise(trigger_volume);
+                raw_noise_tracker_.observe_background_noise(raw_volume);
+                if (noise_tracker_.is_ready() && raw_noise_tracker_.is_ready()) {
                     current_state_.store(LooperState::IDLE, std::memory_order_release);
                 }
                 break;
             }
 
             case LooperState::IDLE: {
+                // 1. שמירת ההיסטוריה הפיזית בזיכרון מעגלי (מבטיח שלא נאבד את ההתקף בזמן שאנחנו ממתינים להוכחת כוונה)
                 for (float s : local_chunk) {
                     preroll_buffer_[preroll_write_idx_] = s;
                     preroll_write_idx_ = (preroll_write_idx_ + 1) % max_preroll_samples;
@@ -409,78 +651,180 @@ void LooperEngine::process_audio_asynchronously() {
 
                 int mode = detection_mode_.load(std::memory_order_relaxed);
 
-                // טריגר אוטומטי (למצבים 0 ו-2)
-                bool auto_triggered = (mode != 1) && (volume > noise_tracker_.get_onset_threshold() && volume > ABSOLUTE_MIN_ONSET_RMS);
-                // טריגר ידני מהנגן (למצב 1: Tap & Trim)
+                // --- אלגוריתם היסטרזיס א-סימטרי מחמיר ---
+
+                if (current_onset_streak_ == 0) {
+                    // שלב א': מבחן התקף חריף. טרנזיינט מוגדר על-ידי *נגזרת* האנרגיה (Flux),
+                    // לא על-ידי רמתה: רמה בלבד נורית גם על היס/שפשוף מתמשך בתדר גבוה.
+                    // לכן דורשים גם רמה מעל הסטטיסטיקה וגם עלייה חדה מול החלון הקודם.
+                    float onset_threshold = std::max(noise_tracker_.get_onset_threshold(),
+                                                     min_onset_rms_.load(std::memory_order_relaxed));
+                    bool level_ok = trigger_volume > onset_threshold;
+                    bool rising = trigger_volume > prev_trigger_volume * onset_rise_ratio_.load(std::memory_order_relaxed);
+                    if (level_ok && rising) {
+                        current_onset_streak_ = 1; // החלון הראשון נתפס
+                        transient_hit_flag_.store(true, std::memory_order_relaxed); // טלמטריה ל-UI
+                    }
+                } else {
+                    // שלב ב': מבחן תוחלת החיים (Sustain). מחפש מסת תהודה לאורך זמן.
+                    // התהודה הגולמית נמדדת מול סטטיסטיקת הרעש *הגולמית* — השוואה מול
+                    // הסטטיסטיקה המסוננת היא שגיאת יחידות (הסקאלות אינן ברות-השוואה).
+                    // הרצפה המוחלטת מנותקת מ-min_onset: היא המבחין העיקרי בין פריטה
+                    // (מסת מיתר ≥0.09) לטרנזיינט סביבתי (≤0.05), וכוילה אמפירית מול הקורפוס.
+                    float absolute_sustain_floor = raw_sustain_floor_.load(std::memory_order_relaxed);
+                    float sustain_threshold = std::max(raw_noise_tracker_.get_silence_threshold(), absolute_sustain_floor);
+
+                    bool is_sustaining = (raw_volume > sustain_threshold);
+
+                    if (is_sustaining) {
+                        current_onset_streak_++; // האנרגיה ממשיכה להתקיים בעולם
+                    } else {
+                        current_onset_streak_ = 0; // האנרגיה מתה מהר מדי. זו הייתה נגיעה אקראית. מוחקים.
+                    }
+                }
+
+                // 2. קבלת החלטה
+                // המכונה תאשר הקלטה רק אם הרצף שרד 4 חלונות (התקף + 3 חלונות תהודה יציבים).
+                bool auto_triggered = (mode != 1) && (current_onset_streak_ >= onset_persistence_target_.load(std::memory_order_relaxed));
                 bool manual_triggered = (mode == 1) && request_record_start_.exchange(false, std::memory_order_relaxed);
 
                 if (auto_triggered || manual_triggered) {
+                    current_onset_streak_ = 0;
                     recorded_audio.clear();
+
+                    // שאיבת הזמן האבוד: אנו מושכים את האודיו מה-Preroll, כך שכל 4 החלונות שעליהם התלבטנו
+                    // (כולל הטרנזיינט הראשוני) מוכנסים במלואם להקלטה הסופית ללא קטיעות.
                     for (size_t i = 0; i < max_preroll_samples; ++i) {
                         size_t read_idx = (preroll_write_idx_ + i) % max_preroll_samples;
                         recorded_audio.push_back(preroll_buffer_[read_idx]);
                     }
-                    peak_recording_rms = volume;
+
+                    peak_envelope = raw_volume;
+                    session_peak_raw = raw_volume;    // רצפת הפעילות נבנית מהסשן הזה בלבד
                     silence_samples_count = 0;
+                    inactivity_count = 0;
+                    trailing_non_musical_samples = 0;
                     current_state_.store(LooperState::RECORDING, std::memory_order_release);
                 } else {
-                    noise_tracker_.observe_background_noise(volume);
+                    // 3. עדכון סביבה דינמי — אך *רק* כשהצ'אנק באמת נראה כמו רקע.
+                    // באג קריטי שתוקן: התקף אמיתי שלא הצית מיד את שלב א' (למשל פריטה
+                    // רכה עם קליק חלש) נלמד כ"רעש", הסף ברח כלפי מעלה מהר מהאות עצמו,
+                    // וההתקף הפך בלתי-ניתן-לזיהוי לצמיתות. הקפאת הלמידה בכל אנרגיה מעל
+                    // חצי רצפת התהודה מונעת את הרעלת רצפת הרעש.
+                    float activity_floor = raw_sustain_floor_.load(std::memory_order_relaxed) * 0.5f;
+                    bool looks_like_background = (raw_volume < activity_floor);
+                    if (current_onset_streak_ == 0 && looks_like_background) {
+                        noise_tracker_.observe_background_noise(trigger_volume);
+                        raw_noise_tracker_.observe_background_noise(raw_volume);
+                    }
                 }
                 break;
             }
 
             case LooperState::RECORDING: {
                 recorded_audio.insert(recorded_audio.end(), local_chunk.begin(), local_chunk.end());
-                if (volume > peak_recording_rms) peak_recording_rms = volume;
+
+                // מעטפת פיק דועכת: התקפה מיידית, שחרור אקספוננציאלי.
+                // המקסימום הכל-זמני קיבע את סף השקט לרגע הכי רועש בהקלטה,
+                // וגרם לעצירה כוזבת בביצוע שנפתח חזק ונרגע לדינמיקה שקטה.
+                peak_envelope = std::max(raw_volume, peak_envelope * env_release_coef);
 
                 int mode = detection_mode_.load(std::memory_order_relaxed);
 
                 if (mode == 1) {
-                    // מצב Tap & Trim: המכונה ממתינה להחלטה אנושית מפורשת כדי לעצור
+                    // מצב Tap & Trim — הנגן קבע את הסוף בעצמו; אין זנב לא-מוזיקלי
                     if (request_record_stop_.exchange(false, std::memory_order_relaxed)) {
+                        trailing_non_musical_samples = 0;
                         current_state_.store(LooperState::PROCESSING, std::memory_order_release);
                     }
                 } else {
-                    // מצב Auto Silence: המכונה מחליטה מתי לעצור על בסיס דעיכת האנרגיה
-                    float dynamic_silence_threshold = std::max(noise_tracker_.get_silence_threshold(), peak_recording_rms * 0.04f);
-                    size_t dynamic_silence_target = static_cast<size_t>(3.5f * config_.sample_rate);
+                    // מצב Auto Silence — שני מסלולי סגירה, סמנטיקה אחידה:
+                    // "פעילות מוזיקלית" = אנרגיה גולמית מעל רצפה יחסית-לסשן.
+                    //
+                    // לקח שנמדד ביוקר: זיהוי "התקף-חוזר" (בכל וריאציה — יחס לצ'אנק
+                    // קודם, יחס למעטפת דועכת) אינו ניתן להפרדה: סטראם בדקרשנדו לעולם
+                    // אינו עולה על מעטפת הסטראם הקודם החזק (יחס 0.98), בעוד אדוות
+                    // ריברב מגיעה ל-1.1-1.3 — ההפרדה הפוכה. לעומת זאת, ה-raw במהלך
+                    // נגינה (כולל בין תווים — המיטה המצלצלת) נשאר ≥0.11, וזנב-סיום
+                    // דועך מתחת לכל רמת נגינה תוך ~שנייה. לכן "פעילות" נמדדת ב-raw
+                    // מול שבריר מהשיא של ההקלטה עצמה — חסין לרווחי-נגינה, לאקורדים
+                    // מוחזקים, לדקרשנדו, ולעוצמת כניסה משתנה בין מכשירים.
+                    session_peak_raw = std::max(session_peak_raw, raw_volume);
+                    float sil_floor = std::max(raw_noise_tracker_.get_silence_threshold(),
+                                               silence_abs_floor_.load(std::memory_order_relaxed));
+                    float activity_floor = std::max(sil_floor,
+                        session_peak_raw * activity_ratio_.load(std::memory_order_relaxed));
+                    size_t silence_target = static_cast<size_t>(
+                        silence_hold_seconds_.load(std::memory_order_relaxed) * config_.sample_rate);
+                    size_t inactivity_target = static_cast<size_t>(
+                        activity_hold_seconds_.load(std::memory_order_relaxed) * config_.sample_rate);
 
-                    if (volume < dynamic_silence_threshold) {
-                        silence_samples_count += local_chunk.size();
-                        if (silence_samples_count >= dynamic_silence_target) {
-                            current_state_.store(LooperState::PROCESSING, std::memory_order_release);
-                        }
-                    } else {
-                        if (volume > peak_recording_rms * 0.15f) {
-                            if (silence_samples_count > 0) silence_samples_count = 0;
-                        } else {
-                            size_t penalty = local_chunk.size() * 3;
-                            if (silence_samples_count > penalty) silence_samples_count -= penalty;
-                            else silence_samples_count = 0;
-                        }
+                    // מסלול א' (מהיר): שקט מוחלט רצוף — לעצירות mute/סטקטו
+                    if (raw_volume < sil_floor) silence_samples_count += local_chunk.size();
+                    else silence_samples_count = 0;
+
+                    // מסלול ב' (איטי): היעדר פעילות — לזנב הד/ריברב שנשאר מעל סף השקט
+                    if (raw_volume >= activity_floor) inactivity_count = 0;
+                    else inactivity_count += local_chunk.size();
+
+                    // סגירה על המוקדם מבין השניים. הזנב הלא-מוזיקלי לקוונטיזציה הוא
+                    // הזמן מאז שהפעילות פסקה — תחילת הדעיכה ≈ הסיום המוזיקלי, ולכן
+                    // אין צורך בתיקוני "+פעימה" הוריסטיים.
+                    if (silence_samples_count >= silence_target ||
+                        inactivity_count >= inactivity_target) {
+                        trailing_non_musical_samples = std::max(silence_samples_count, inactivity_count);
+                        current_state_.store(LooperState::PROCESSING, std::memory_order_release);
                     }
+                }
+
+                // רשת ביטחון: הקלטה שלא נסגרת לעולם לא תרוקן את זיכרון המכשיר
+                if (recorded_audio.size() >= max_record_samples) {
+                    std::cout << "[DSP] Max recording length reached — forcing PROCESSING." << std::endl;
+                    trailing_non_musical_samples = 0;
+                    current_state_.store(LooperState::PROCESSING, std::memory_order_release);
                 }
                 break;
             }
 
             case LooperState::PROCESSING: {
-                size_t preroll_samples = static_cast<size_t>(config_.preroll_seconds * config_.sample_rate);
-                size_t onset_index = find_true_onset(recorded_audio, preroll_samples, std::max(noise_tracker_.get_onset_threshold(), ABSOLUTE_MIN_ONSET_RMS));
+                // סף במרחב הגולמי — האודיו המוקלט הוא גולמי, לא מסונן
+                size_t onset_index = find_true_onset(recorded_audio, max_preroll_samples,
+                    std::max(raw_noise_tracker_.get_onset_threshold(), min_onset_rms_.load(std::memory_order_relaxed)));
 
                 if (onset_index > 0 && onset_index < recorded_audio.size()) {
                     recorded_audio.erase(recorded_audio.begin(), recorded_audio.begin() + onset_index);
                 }
 
-                if (recorded_audio.size() <= silence_samples_count) {
+                if (recorded_audio.size() <= trailing_non_musical_samples) {
                     current_state_.store(LooperState::IDLE, std::memory_order_release);
                     break;
                 }
 
-                float beat_length = extract_beat_length_from_onsets(recorded_audio);
-                float actual_playing_samples = static_cast<float>(recorded_audio.size() - silence_samples_count);
+                // תוכן מוזיקלי = הכל פחות הזנב הלא-מוזיקלי. הזנב נמדד מהרגע שבו
+                // הפעילות פסקה (raw צנח מתחת לרצפה היחסית) — שהוא בקירוב טוב הסיום
+                // המוזיקלי עצמו, ולכן אין צורך בתיקונים הוריסטיים נוספים.
+                float actual_playing_samples = static_cast<float>(recorded_audio.size() - trailing_non_musical_samples);
+                // אומדן הקצב רץ על הקטע המוזיקלי בלבד — זנב הד/שקט מדלל את
+                // האוטוקורלציה של עקומת ה-Novelty ומטה את השיא.
+                float beat_length = extract_beat_length_from_onsets(
+                    recorded_audio, static_cast<size_t>(actual_playing_samples));
                 float exact_beats = actual_playing_samples / beat_length;
                 float target_musical_beats = quantize_to_musical_phrase(exact_beats);
-                size_t ideal_length = static_cast<size_t>(target_musical_beats * beat_length);
+                float quantized_length = target_musical_beats * beat_length;
+                // הקוונטיזציה *מעדנת* את המדידה הפיזית — לא דורסת אותה. רצועת
+                // הקבלה היא חצי-פעימה (+מרווח): אם ההצמדה דורשת הזזה של יותר
+                // מחצי פעימה מהאורך המדוד, אחד מהשניים שגוי — נשארים עם המדידה.
+                float deviation = std::abs(quantized_length - actual_playing_samples);
+                bool grid_accepted = (deviation <= 0.6f * beat_length);
+                size_t ideal_length = static_cast<size_t>(
+                    grid_accepted ? quantized_length : actual_playing_samples);
+
+                std::cout << "[DSP] Loop assembly: beat=" << (beat_length / config_.sample_rate)
+                          << "s (" << estimated_bpm_.load(std::memory_order_relaxed) << " BPM)"
+                          << " playing=" << (actual_playing_samples / config_.sample_rate)
+                          << "s exact_beats=" << exact_beats << " -> " << target_musical_beats
+                          << " grid=" << (grid_accepted ? "ACCEPTED" : "REJECTED")
+                          << " final=" << (static_cast<float>(ideal_length) / config_.sample_rate) << "s" << std::endl;
 
                 std::vector<float> final_loop;
                 final_loop.reserve(ideal_length);
@@ -488,25 +832,43 @@ void LooperEngine::process_audio_asynchronously() {
                     final_loop.push_back(recorded_audio[i]);
                 }
 
+                bool tail_folded = false;
                 if (final_loop.size() < ideal_length) {
                     final_loop.resize(ideal_length, 0.0f);
                 } else if (recorded_audio.size() > ideal_length) {
+                    // קיפול הזנב לראש הלופ. ה-Fade חל על *הזנב בלבד* — הכפלת הסכום
+                    // כולו (הבאג הקודם) הנחיתה את פתיחת הלופ עצמה מ-100% לאפס לאורך
+                    // עד חצי לופ, ויצרה את "צניחת העוצמה וחזרתה" שנשמעה בכל סיבוב.
+                    // הקיפול גם מספק את רציפות התפר: tail[0] הוא ההמשך הפיזי המדויק
+                    // של הדגימה האחרונה בלופ, ותחילת הלופ (אחרי חיתוך ל-Onset) היא ~0.
                     size_t tail_length = recorded_audio.size() - ideal_length;
-                    tail_length = std::min(tail_length, ideal_length / 2);
+                    tail_length = std::min(tail_length, ideal_length);
                     for (size_t i = 0; i < tail_length; ++i) {
-                        final_loop[i] += recorded_audio[ideal_length + i];
                         float tail_fade = 1.0f - (static_cast<float>(i) / static_cast<float>(tail_length));
-                        final_loop[i] = std::clamp(final_loop[i] * tail_fade, -1.0f, 1.0f);
+                        float mixed = final_loop[i] + recorded_audio[ideal_length + i] * tail_fade;
+                        final_loop[i] = std::clamp(mixed, -1.0f, 1.0f);
                     }
+                    tail_folded = true;
                 }
 
-                final_loop = apply_zero_crossing_crossfade(final_loop, 256);
+                // Crossfade קצה מופעל רק כשאין זנב מקופל: הוא משנה את אורך הלופ
+                // (עד 256 דגימות — סחיפת טמפו מצטברת) ומאפס את הקצה, מה ששובר את
+                // רציפות התפר שהקיפול כבר מבטיח. עם קיפול — התפר רציף מעצם הבנייה.
+                if (!tail_folded) {
+                    final_loop = apply_zero_crossing_crossfade(final_loop, 256);
+                }
 
                 if (!final_loop.empty()) {
-                    int inactive_idx = 1 - active_playback_idx_.load(std::memory_order_relaxed);
-                    playback_buffers_[inactive_idx] = std::move(final_loop);
+                    last_published_loop_samples = final_loop.size();
+                    // הקורא רדום במצב PROCESSING, ולכן החוצץ מוענק מיידית
+                    int slot = acquire_writable_slot();
+                    if (slot < 0) slot = 1 - active_playback_idx_.load(std::memory_order_relaxed);
+                    {
+                        std::lock_guard<std::mutex> lock(buffer_mutex_);
+                        playback_buffers_[slot] = std::move(final_loop);
+                    }
                     playback_read_idx_.store(0, std::memory_order_relaxed);
-                    active_playback_idx_.store(inactive_idx, std::memory_order_release);
+                    active_playback_idx_.store(slot, std::memory_order_release);
                     current_state_.store(LooperState::LOOPING, std::memory_order_release);
                 } else {
                     current_state_.store(LooperState::IDLE, std::memory_order_release);
@@ -515,43 +877,123 @@ void LooperEngine::process_audio_asynchronously() {
             }
 
             case LooperState::LOOPING: {
-                if (request_overdub_.load(std::memory_order_relaxed)) {
-                    current_state_.store(LooperState::OVERDUBBING, std::memory_order_release);
-                    request_overdub_.store(false, std::memory_order_relaxed);
+                if (request_overdub_.exchange(false, std::memory_order_relaxed)) {
+                    // כניסה לאוברדאב: מעתיקים את הלופ החי לסקראץ' פרטי של ה-Worker.
+                    // כל הכתיבות יקרו בסקראץ' — לעולם לא בחוצץ שהרמקול קורא ממנו.
+                    {
+                        std::lock_guard<std::mutex> lock(buffer_mutex_);
+                        overdub_scratch = playback_buffers_[active_playback_idx_.load(std::memory_order_relaxed)];
+                    }
+                    if (!overdub_scratch.empty()) {
+                        overdub_idx = playback_read_idx_.load(std::memory_order_relaxed) % overdub_scratch.size();
+                        overdub_publish_pending = false;
+                        current_state_.store(LooperState::OVERDUBBING, std::memory_order_release);
+                    }
                 }
                 break;
             }
 
             case LooperState::OVERDUBBING: {
-                int active_idx = active_playback_idx_.load(std::memory_order_acquire);
-                auto& active_buffer = playback_buffers_[active_idx];
-                size_t buffer_size = active_buffer.size();
-
-                if (buffer_size > 0) {
-                    size_t overdub_idx = playback_read_idx_.load(std::memory_order_relaxed);
-                    for (float sample : local_chunk) {
-                        active_buffer[overdub_idx] = mix_and_soft_clip(active_buffer[overdub_idx], sample);
+                if (!overdub_scratch.empty()) {
+                    for (float s : local_chunk) {
+                        overdub_scratch[overdub_idx] = mix_and_soft_clip(overdub_scratch[overdub_idx], s);
                         overdub_idx++;
-                        if (overdub_idx >= buffer_size) overdub_idx = 0;
+                        if (overdub_idx >= overdub_scratch.size()) {
+                            overdub_idx = 0;
+                            // פרסום בסוף כל סיבוב — השכבה החדשה נשמעת בסיבוב הבא
+                            overdub_publish_pending = true;
+                        }
                     }
                 }
 
-                if (request_looping_.load(std::memory_order_relaxed)) {
-                    current_state_.store(LooperState::LOOPING, std::memory_order_release);
-                    request_looping_.store(false, std::memory_order_relaxed);
+                bool exit_requested = request_looping_.load(std::memory_order_relaxed);
+
+                if (overdub_publish_pending || exit_requested) {
+                    int slot = acquire_writable_slot();
+                    if (slot >= 0) {
+                        {
+                            std::lock_guard<std::mutex> lock(buffer_mutex_);
+                            playback_buffers_[slot] = overdub_scratch;   // העתקה — הסקראץ' ממשיך לשמש אותנו
+                        }
+                        // אורך זהה בדיוק — הקורא ממשיך מאותו אינדקס בלי קפיצה
+                        active_playback_idx_.store(slot, std::memory_order_release);
+                        overdub_publish_pending = false;
+
+                        if (exit_requested) {
+                            request_looping_.store(false, std::memory_order_relaxed);
+                            overdub_scratch.clear();
+                            overdub_scratch.shrink_to_fit();
+                            current_state_.store(LooperState::LOOPING, std::memory_order_release);
+                        }
+                    }
+                    // slot == -1: נדחה לצ'אנק הבא; הדאבים ממשיכים להצטבר בסקראץ', דבר לא אובד
                 }
                 break;
             }
         }
+
+        // --- טלמטריה למחקר כוונון (Harness אופליין; null במכשיר → עלות ענף בודד) ---
+        if (TelemetrySink sink = telemetry_sink_.load(std::memory_order_relaxed)) {
+            ChunkTelemetry t;
+            t.time_seconds = static_cast<double>(total_samples_processed) / config_.sample_rate;
+            t.state_before = state;
+            t.state_after = current_state_.load(std::memory_order_relaxed);
+            t.raw_rms = raw_volume;
+            t.trigger_rms = trigger_volume;
+            t.rise_ratio = trigger_volume / std::max(prev_trigger_volume, 1e-9f);
+            float min_onset = min_onset_rms_.load(std::memory_order_relaxed);
+            t.onset_level_threshold = std::max(noise_tracker_.get_onset_threshold(), min_onset);
+            t.sustain_threshold = std::max(raw_noise_tracker_.get_silence_threshold(),
+                                           raw_sustain_floor_.load(std::memory_order_relaxed));
+            t.silence_threshold = std::max(raw_noise_tracker_.get_silence_threshold(),
+                                           silence_abs_floor_.load(std::memory_order_relaxed));
+            t.peak_envelope = peak_envelope;
+            t.onset_streak = current_onset_streak_;
+            t.noise_mean_trigger = noise_tracker_.get_mean();
+            t.noise_std_trigger = noise_tracker_.get_std_dev();
+            t.noise_mean_raw = raw_noise_tracker_.get_mean();
+            t.noise_std_raw = raw_noise_tracker_.get_std_dev();
+            t.spectral_flux = current_flux;
+            t.flux_threshold = current_flux_threshold;
+            t.published_loop_samples = last_published_loop_samples;
+            last_published_loop_samples = 0;   // מדווח פעם אחת, בצ'אנק הפרסום
+            sink(t, telemetry_user_.load(std::memory_order_relaxed));
+        }
+
+        // עדכון היסטוריית ה-Flux לסף האדפטיבי (אופליין בלבד, כשה-Sink פעיל)
+        if (telemetry_active &&
+            (current_flux < current_flux_threshold || current_flux_threshold == 0.0f)) {
+            flux_hist[flux_hist_idx] = current_flux;
+            flux_hist_idx = (flux_hist_idx + 1) % flux_hist.size();
+        }
+
+        // נקודת הייחוס של ה-Flux לצ'אנק הבא
+        prev_trigger_volume = trigger_volume;
+        local_chunk.clear();
     }
+
+    kiss_fftr_free(flux_cfg);
+}
+
+size_t LooperEngine::feed_audio_offline(const float* data, size_t num_samples) {
+    size_t accepted = 0;
+    while (accepted < num_samples && input_queue_.push(data[accepted])) {
+        ++accepted;
+    }
+    return accepted;
 }
 
 bool LooperEngine::export_to_wav(const char* filepath) {
-    // השגת הווקטור המנוגן כרגע
-    int active_idx = active_playback_idx_.load(std::memory_order_acquire);
-    const auto& active_buffer = playback_buffers_[active_idx];
+    // צילום מצב תחת נעילה קצרה — ואז כתיבת הקובץ האיטית מחוץ לנעילה,
+    // כדי שה-Worker לא יחליף/יכתוב את הווקטור באמצע ה-I/O
+    std::vector<float> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        int active_idx = active_playback_idx_.load(std::memory_order_acquire);
+        snapshot = playback_buffers_[active_idx];
+    }
 
-    if (active_buffer.empty()) {
+    if (snapshot.empty()) {
         return false;
     }
 
@@ -565,7 +1007,7 @@ bool LooperEngine::export_to_wav(const char* filepath) {
     }
 
     // שפיכת הזיכרון לקובץ
-    ma_encoder_write_pcm_frames(&encoder, active_buffer.data(), active_buffer.size(), nullptr);
+    ma_encoder_write_pcm_frames(&encoder, snapshot.data(), snapshot.size(), nullptr);
     ma_encoder_uninit(&encoder);
 
     std::cout << "[I/O] Successfully exported loop to: " << filepath << std::endl;
@@ -596,16 +1038,27 @@ bool LooperEngine::import_from_wav(const char* filepath) {
     // החלת אלגוריתם ה-Crossfade על הקובץ המיובא כדי להבטיח לופ מושלם ללא קליקים דיגיטליים
     loaded_audio = apply_zero_crossing_crossfade(loaded_audio, 256);
 
-    // --- החלפת מציאות אטומית (Atomic Swap) ---
-    // אנחנו מעתיקים את המידע לחוצץ שכרגע נח, ואז מחליפים את המצביעים באופן Thread-Safe
-    int inactive_idx = 1 - active_playback_idx_.load(std::memory_order_relaxed);
-    playback_buffers_[inactive_idx] = std::move(loaded_audio);
-    playback_read_idx_.store(0, std::memory_order_relaxed);
-    active_playback_idx_.store(inactive_idx, std::memory_order_release);
+    // --- מסירה ל-Worker במקום פרסום ישיר ---
+    // רק ה-Worker רשאי לפרסם חוצצים: פרסום משני Threads שובר את מודל ה-RCU
+    // (שני מפרסמים עלולים לבחור את אותו Slot ולדרוס זה את זה).
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        pending_import_ = std::move(loaded_audio);
+    }
+    has_pending_import_.store(true, std::memory_order_release);
 
-    // כפיית המכונה למצב נגינה באופן מיידי
-    current_state_.store(LooperState::LOOPING, std::memory_order_release);
-
-    std::cout << "[I/O] Successfully imported loop and injected to DSP." << std::endl;
+    std::cout << "[I/O] Successfully decoded loop — handed off to DSP worker." << std::endl;
     return true;
+}
+
+float LooperEngine::calculate_trigger_rms(const std::vector<float>& chunk) {
+    if (chunk.empty()) return 0.0f;
+    float sum_squares = 0.0f;
+    for (float sample : chunk) {
+        // סינון תדרים נמוכים - מעלים רעשי גוף ומזגן
+        float filtered = sample - 0.95f * pre_emphasis_state_;
+        pre_emphasis_state_ = sample;
+        sum_squares += filtered * filtered;
+    }
+    return std::sqrt(sum_squares / chunk.size());
 }

@@ -55,8 +55,13 @@ bool OboeLooperEngine::start() {
     recording_stream_->setBufferSizeInFrames(optimal_buffer_size);
     playback_stream_->setBufferSizeInFrames(playback_stream_->getFramesPerBurst() * 2);
 
-    // עדכון ה-DSP על הלייטנסי האמיתי של המערכת
-    dsp_engine_.update_hardware_latency(static_cast<float>(optimal_buffer_size) / static_cast<float>(recording_stream_->getSampleRate()));
+    // עדכון ה-DSP על קצב הדגימה האמיתי של החומרה ועל הלייטנסי שלה.
+    // קריטי: Oboe פותח את המיקרופון בקצב הנייטיב של המכשיר (בדרך כלל 48000),
+    // בעוד המנוע נבנה עם ברירת מחדל של 44100 — בלי העדכון הזה כל קבועי הזמן
+    // (Preroll, סף השקט, חישוב ה-BPM) סוטים בכ-9% בכל מכשיר מודרני.
+    int hardware_sample_rate = recording_stream_->getSampleRate();
+    dsp_engine_.update_hardware_config(hardware_sample_rate,
+        static_cast<float>(optimal_buffer_size) / static_cast<float>(hardware_sample_rate));
 
     // פתיחת הסכרים
     recording_stream_->requestStart();
