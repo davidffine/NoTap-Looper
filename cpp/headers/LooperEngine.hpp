@@ -179,7 +179,8 @@ private:
     float calculate_rms(const std::vector<float>& chunk);
     size_t find_true_onset(const std::vector<float>& audio_data, size_t max_search_samples, float threshold);
     std::vector<float> extract_novelty_curve(const std::vector<float>& audio_data, int env_sr, int& out_chunk_size);
-    float extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples);
+    float extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples,
+                                          size_t* last_onset_samples = nullptr);
     float quantize_to_musical_phrase(float raw_beats);
     std::vector<float> apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples = 256);
     void process_audio_asynchronously();

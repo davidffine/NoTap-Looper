@@ -291,9 +291,11 @@ float LooperEngine::quantize_to_musical_phrase(float raw_beats) {
 // (חסינה לפספוס/עודף פיקים), ההצבעה ההרמונית פותרת את דו-המשמעות האוקטבית
 // (פעימה מול חצי/כפל פעימה), ואינטרפולציה פרבולית נותנת רזולוציה תת-צ'אנקית
 // (הצ'אנק לבדו = ±1.4% שגיאת טמפו שמצטברת לשניות בלופים ארוכים).
-float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples) {
+float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples,
+                                                    size_t* last_onset_samples) {
     const float fallback = (60.0f / 120.0f) * config_.sample_rate;
-    auto give_up = [&]() { estimated_bpm_.store(120.0f, std::memory_order_relaxed); return fallback; };
+    auto give_up = [&]() { estimated_bpm_.store(120.0f, std::memory_order_relaxed);
+                           if (last_onset_samples) *last_onset_samples = 0; return fallback; };
 
     if (analysis_samples > audio_data.size()) analysis_samples = audio_data.size();
     if (analysis_samples < static_cast<size_t>(config_.sample_rate)) return give_up();
@@ -304,6 +306,19 @@ float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& au
     std::vector<float> novelty = extract_novelty_curve(segment, 0, hop);
     if (hop == 0 || novelty.size() < 32) return give_up();
     const int N = static_cast<int>(novelty.size());
+
+    // ההתקף האחרון: הפיק המשמעותי האחרון בעקומת ה-Novelty. מפריד בין סיום
+    // "מוכה" (פיק סמוך לקצה → המדידה מדויקת) לסיום "מצלצל" (הפיק האחרון הרחק
+    // מהקצה, השאר דעיכה → המדידה קצרה ויש להשלים את התיבה).
+    if (last_onset_samples) {
+        float nov_mean = std::accumulate(novelty.begin(), novelty.end(), 0.0f) / N;
+        float onset_thr = nov_mean * 1.5f;
+        int last_peak = 0;
+        for (int i = 1; i < N - 1; ++i)
+            if (novelty[i] > onset_thr && novelty[i] >= novelty[i - 1] && novelty[i] > novelty[i + 1])
+                last_peak = i;
+        *last_onset_samples = static_cast<size_t>(last_peak) * hop;
+    }
 
     // הסרת מגמה איטית (ממוצע-נע ~0.5s): משאירה את מבנה הפעימות בלבד,
     // בלי שהמעטפת האיטית של הביצוע תזלוג לאוטוקורלציה.
@@ -806,9 +821,11 @@ void LooperEngine::process_audio_asynchronously() {
                 float actual_playing_samples = static_cast<float>(recorded_audio.size() - trailing_non_musical_samples);
                 // אומדן הקצב רץ על הקטע המוזיקלי בלבד — זנב הד/שקט מדלל את
                 // האוטוקורלציה של עקומת ה-Novelty ומטה את השיא.
+                size_t last_onset_samples = 0;
                 float beat_length = extract_beat_length_from_onsets(
-                    recorded_audio, static_cast<size_t>(actual_playing_samples));
+                    recorded_audio, static_cast<size_t>(actual_playing_samples), &last_onset_samples);
                 float exact_beats = actual_playing_samples / beat_length;
+                float last_onset_beats = static_cast<float>(last_onset_samples) / beat_length;
                 float target_musical_beats = quantize_to_musical_phrase(exact_beats);
                 float quantized_length = target_musical_beats * beat_length;
                 // הקוונטיזציה *מעדנת* את המדידה הפיזית — לא דורסת אותה. רצועת
@@ -822,7 +839,10 @@ void LooperEngine::process_audio_asynchronously() {
                 std::cout << "[DSP] Loop assembly: beat=" << (beat_length / config_.sample_rate)
                           << "s (" << estimated_bpm_.load(std::memory_order_relaxed) << " BPM)"
                           << " playing=" << (actual_playing_samples / config_.sample_rate)
-                          << "s exact_beats=" << exact_beats << " -> " << target_musical_beats
+                          << "s exact_beats=" << exact_beats
+                          << " last_onset_beats=" << last_onset_beats
+                          << " ring_out=" << (exact_beats - last_onset_beats)
+                          << " -> " << target_musical_beats
                           << " grid=" << (grid_accepted ? "ACCEPTED" : "REJECTED")
                           << " final=" << (static_cast<float>(ideal_length) / config_.sample_rate) << "s" << std::endl;
 
