@@ -12,6 +12,13 @@
 #include <pmmintrin.h>
 #endif
 
+// פרמטרי הריברב — מקור אמת יחיד, כדי שהעיבוד החי וה-Bake ל-Export יישמעו זהים.
+namespace {
+    constexpr float REVERB_ROOM = 0.72f;
+    constexpr float REVERB_DAMP = 0.45f;
+    constexpr float REVERB_WET  = 0.55f;
+}
+
 // FTZ/DAZ הם מצב של רגיסטר ה-FP *של ה-Thread הנוכחי*.
 // חייבים להיקרא מתוך ה-Worker עצמו — קריאה מה-Constructor מגינה על ה-Thread הלא נכון.
 // באנדרואיד האמיתי (ARM) הענף של x86 לא מתקמפל כלל, ולכן חובה ענף FPCR/FPSCR ייעודי.
@@ -98,6 +105,8 @@ LooperEngine::LooperEngine(EngineConfig config) :
         noise_tracker_(config.sample_rate, config.chunk_size, 1.0f),
         raw_noise_tracker_(config.sample_rate, config.chunk_size, 1.0f)
 {
+    reverb_.init(config_.sample_rate);
+    reverb_.set_params(REVERB_ROOM, REVERB_DAMP);   // "produced" default
     worker_thread_ = std::thread(&LooperEngine::process_audio_asynchronously, this);
 }
 
@@ -118,6 +127,10 @@ void LooperEngine::set_detection_mode(int mode) {
 
 float LooperEngine::get_estimated_bpm() const {
     return estimated_bpm_.load(std::memory_order_relaxed);
+}
+
+float LooperEngine::get_loop_beats() const {
+    return loop_beats_.load(std::memory_order_relaxed);
 }
 
 float LooperEngine::get_loop_position() const {
@@ -146,34 +159,84 @@ void LooperEngine::on_audio_callback(const float* input_data, size_t num_frames)
 
 void LooperEngine::process_output_callback(float* output_data, size_t num_frames) {
     LooperState state = current_state_.load(std::memory_order_relaxed);
-    if (state != LooperState::LOOPING && state != LooperState::OVERDUBBING) {
-        for (size_t i = 0; i < num_frames; ++i) { output_data[i] = 0.0f; }
-        return;
+    bool playing = (state == LooperState::LOOPING || state == LooperState::OVERDUBBING);
+
+    size_t loop_pos = 0, loop_size = 0;   // ל-lock המטרונום בזמן נגינה
+
+    if (!playing) {
+        for (size_t i = 0; i < num_frames; ++i) output_data[i] = 0.0f;
+    } else {
+        int active_idx = active_playback_idx_.load(std::memory_order_acquire);
+        // איתות Grace: ה-Worker רשאי לכתוב לחוצץ הלא-פעיל רק אחרי שנצפינו כאן על הפעיל.
+        reader_observed_idx_.store(active_idx, std::memory_order_release);
+        const auto& active_buffer = playback_buffers_[active_idx];
+
+        if (active_buffer.empty()) {
+            for (size_t i = 0; i < num_frames; ++i) output_data[i] = 0.0f;
+        } else {
+            size_t buffer_size = active_buffer.size();
+            size_t current_idx = playback_read_idx_.load(std::memory_order_relaxed);
+            if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
+            loop_pos = current_idx; loop_size = buffer_size;
+            for (size_t i = 0; i < num_frames; ++i) {
+                output_data[i] = active_buffer[current_idx];
+                current_idx++;
+                if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
+            }
+            playback_read_idx_.store(current_idx, std::memory_order_relaxed);
+        }
     }
 
-    int active_idx = active_playback_idx_.load(std::memory_order_acquire);
-    // איתות Grace: ה-Worker רשאי לכתוב לחוצץ הלא-פעיל רק אחרי שנצפינו כאן על הפעיל.
-    // הקולבקים של Oboe סדרתיים, ולכן צפייה על אינדקס חדש מוכיחה שהקריאה הקודמת הסתיימה.
-    reader_observed_idx_.store(active_idx, std::memory_order_release);
-
-    const auto& active_buffer = playback_buffers_[active_idx];
-
-    if (active_buffer.empty()) {
-        for (size_t i = 0; i < num_frames; ++i) { output_data[i] = 0.0f; }
-        return;
+    // ריברב על אות הלופ (רטוב מתווסף ליבש). מוחל לפני המטרונום כדי שהקליקים
+    // יישארו יבשים וברורים. לא-הרסני: החוצץ המוקלט לא משתנה.
+    if (playing && reverb_enabled_.load(std::memory_order_relaxed)) {
+        for (size_t i = 0; i < num_frames; ++i) {
+            float wet = reverb_.process(output_data[i]);
+            output_data[i] = std::clamp(output_data[i] + wet * REVERB_WET, -1.0f, 1.0f);
+        }
     }
 
-    size_t buffer_size = active_buffer.size();
-    size_t current_idx = playback_read_idx_.load(std::memory_order_relaxed);
-    // הגנה מפני אינדקס ישן שנשאר מלופ ארוך יותר — קריאה מעבר לגבול היא UB
-    if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
+    render_metronome(output_data, num_frames, state, playing, loop_pos, loop_size);
+}
+
+// מטרונום/Count-in למצב SYNC. רץ על ה-Thread של ה-Output. בזמן נגינה גזור הקצב
+// *ממיקום הלופ* (נעילה מושלמת ללא סחיפה); ב-IDLE השתמש במונה חופשי (ספירה-לתוך).
+void LooperEngine::render_metronome(float* out, size_t num_frames, LooperState state,
+                                    bool playing, size_t loop_pos, size_t loop_size) {
+    if (detection_mode_.load(std::memory_order_relaxed) != 2) return;          // מצב SYNC בלבד
+    if (!metronome_user_enabled_.load(std::memory_order_relaxed)) return;      // כיבוי משתמש
+    if (!(state == LooperState::IDLE || playing)) return;                      // לא ב-REC/CAL/PROC
+
+    float bpm = target_bpm_.load(std::memory_order_relaxed);
+    if (bpm < 20.0f || bpm > 400.0f) return;
+    const double TWO_PI = 6.283185307179586;
+    double beat_period = (60.0 / bpm) * static_cast<double>(config_.sample_rate);
+    if (beat_period < 1.0) return;
+    const float click_decay = std::exp(-1.0f / (0.018f * config_.sample_rate));
 
     for (size_t i = 0; i < num_frames; ++i) {
-        output_data[i] = active_buffer[current_idx];
-        current_idx++;
-        if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
+        double pos;
+        if (playing && loop_size > 0) {
+            pos = static_cast<double>((loop_pos + i) % loop_size);   // נעול ללופ
+        } else {
+            pos = metro_free_counter_;
+            metro_free_counter_ += 1.0;
+        }
+        long beat = static_cast<long>(pos / beat_period);
+        if (beat != metro_last_beat_) {
+            metro_last_beat_ = beat;
+            bool downbeat = (beat % 4 == 0);       // 4/4 — פעימה 1 מודגשת
+            click_freq_ = downbeat ? 1600.0f : 1000.0f;
+            click_env_  = downbeat ? 0.32f : 0.20f;
+            click_phase_ = 0.0;
+        }
+        if (click_env_ > 0.001f) {
+            float s = static_cast<float>(std::sin(click_phase_)) * click_env_;
+            out[i] = std::clamp(out[i] + s, -1.0f, 1.0f);
+            click_phase_ += TWO_PI * click_freq_ / config_.sample_rate;
+            click_env_ *= click_decay;
+        }
     }
-    playback_read_idx_.store(current_idx, std::memory_order_relaxed);
 }
 
 LooperState LooperEngine::get_current_state() const { return current_state_.load(std::memory_order_relaxed); }
@@ -423,6 +486,53 @@ std::vector<float> LooperEngine::apply_zero_crossing_crossfade(std::vector<float
     return result;
 }
 
+std::vector<float> LooperEngine::apply_loop_effect(const std::vector<float>& src, int fx) {
+    std::vector<float> dst;
+    if (src.empty()) return dst;
+    auto lerp = [&](double pos) -> float {
+        if (pos <= 0.0) return src.front();
+        size_t i = static_cast<size_t>(pos);
+        if (i + 1 >= src.size()) return src.back();
+        float f = static_cast<float>(pos - i);
+        return src[i] * (1.0f - f) + src[i + 1] * f;
+    };
+    switch (fx) {
+        case 1: // reverse — same length, stays in sync
+            dst.assign(src.rbegin(), src.rend());
+            break;
+        case 2: { // octave up — read at 2× (higher pitch, half length)
+            dst.resize(src.size() / 2);
+            for (size_t i = 0; i < dst.size(); ++i) dst[i] = lerp(i * 2.0);
+            break;
+        }
+        case 3: { // octave down — read at 0.5× (lower pitch, double length)
+            dst.resize(src.size() * 2);
+            for (size_t i = 0; i < dst.size(); ++i) dst[i] = lerp(i * 0.5);
+            break;
+        }
+        default: return dst;
+    }
+    dst = apply_zero_crossing_crossfade(dst, 256);   // clean seam after transform
+    return dst;
+}
+
+int LooperEngine::get_loop_waveform(float* out, int max_bins) {
+    if (!out || max_bins <= 0) return 0;
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    const auto& buf = playback_buffers_[active_playback_idx_.load(std::memory_order_acquire)];
+    size_t n = buf.size();
+    if (n == 0) return 0;
+    for (int b = 0; b < max_bins; ++b) {
+        size_t start = static_cast<size_t>(static_cast<double>(b) / max_bins * n);
+        size_t end   = static_cast<size_t>(static_cast<double>(b + 1) / max_bins * n);
+        if (end > n) end = n;
+        float peak = 0.0f;
+        for (size_t i = start; i < end; ++i) peak = std::max(peak, std::fabs(buf[i]));
+        out[b] = peak;
+    }
+    return max_bins;
+}
+
 void LooperEngine::process_audio_asynchronously() {
     // הגנת דנורמלים — חייבת לרוץ על ה-Thread הזה עצמו
     enable_denormal_flush_to_zero();
@@ -593,6 +703,7 @@ void LooperEngine::process_audio_asynchronously() {
             peak_envelope = 0.0f;
             prev_trigger_volume = 0.0f;
             estimated_bpm_.store(0.0f, std::memory_order_relaxed);
+            loop_beats_.store(0.0f, std::memory_order_relaxed);
             // קודם עוצרים את הקורא (מעבר ל-IDLE), ומשחררים את החוצצים רק אחרי
             // תקופת חסד בזמן-אמת — כדי שקולבק שנמצא באמצע קריאה לא יישמט מתחתיו.
             current_state_.store(LooperState::IDLE, std::memory_order_release);
@@ -819,32 +930,51 @@ void LooperEngine::process_audio_asynchronously() {
                 // הפעילות פסקה (raw צנח מתחת לרצפה היחסית) — שהוא בקירוב טוב הסיום
                 // המוזיקלי עצמו, ולכן אין צורך בתיקונים הוריסטיים נוספים.
                 float actual_playing_samples = static_cast<float>(recorded_audio.size() - trailing_non_musical_samples);
-                // אומדן הקצב רץ על הקטע המוזיקלי בלבד — זנב הד/שקט מדלל את
-                // האוטוקורלציה של עקומת ה-Novelty ומטה את השיא.
-                size_t last_onset_samples = 0;
-                float beat_length = extract_beat_length_from_onsets(
-                    recorded_audio, static_cast<size_t>(actual_playing_samples), &last_onset_samples);
-                float exact_beats = actual_playing_samples / beat_length;
-                float last_onset_beats = static_cast<float>(last_onset_samples) / beat_length;
-                float target_musical_beats = quantize_to_musical_phrase(exact_beats);
-                float quantized_length = target_musical_beats * beat_length;
-                // הקוונטיזציה *מעדנת* את המדידה הפיזית — לא דורסת אותה. רצועת
-                // הקבלה היא חצי-פעימה (+מרווח): אם ההצמדה דורשת הזזה של יותר
-                // מחצי פעימה מהאורך המדוד, אחד מהשניים שגוי — נשארים עם המדידה.
-                float deviation = std::abs(quantized_length - actual_playing_samples);
-                bool grid_accepted = (deviation <= 0.6f * beat_length);
-                size_t ideal_length = static_cast<size_t>(
-                    grid_accepted ? quantized_length : actual_playing_samples);
+                int assembly_mode = detection_mode_.load(std::memory_order_relaxed);
+                size_t ideal_length;
 
-                std::cout << "[DSP] Loop assembly: beat=" << (beat_length / config_.sample_rate)
-                          << "s (" << estimated_bpm_.load(std::memory_order_relaxed) << " BPM)"
-                          << " playing=" << (actual_playing_samples / config_.sample_rate)
-                          << "s exact_beats=" << exact_beats
-                          << " last_onset_beats=" << last_onset_beats
-                          << " ring_out=" << (exact_beats - last_onset_beats)
-                          << " -> " << target_musical_beats
-                          << " grid=" << (grid_accepted ? "ACCEPTED" : "REJECTED")
-                          << " final=" << (static_cast<float>(ideal_length) / config_.sample_rate) << "s" << std::endl;
+                if (assembly_mode == 2) {
+                    // --- מצב SYNC (שעון): הקצב נמסר על-ידי הנגן, ולכן ההצמדה לתיבות
+                    // *סמכותית* (בניגוד ל-AUTO שבו הקצב מאומד ולא-ודאי → ההצמדה נסוגה).
+                    // ההתקף מגדיר את פעימה 1; ה-Auto-Silence מגדיר סוף גס; אנו מצמידים
+                    // למספר שלם של תיבות (4/4) בקצב שנקבע ⇒ אורך מדויק-לדגימה שמסתנכרן.
+                    float bpm = target_bpm_.load(std::memory_order_relaxed);
+                    if (bpm < 20.0f) bpm = 120.0f;
+                    float beat_length = (60.0f / bpm) * config_.sample_rate;
+                    float exact_beats = actual_playing_samples / beat_length;
+                    const float BEATS_PER_BAR = 4.0f;
+                    float bars = std::round(exact_beats / BEATS_PER_BAR);
+                    if (bars < 1.0f) bars = 1.0f;
+                    float target_musical_beats = bars * BEATS_PER_BAR;
+                    ideal_length = static_cast<size_t>(target_musical_beats * beat_length);
+                    estimated_bpm_.store(bpm, std::memory_order_relaxed);
+                    loop_beats_.store(target_musical_beats, std::memory_order_relaxed);
+                    std::cout << "[DSP] Clock loop: " << bars << " bars @ " << bpm << " BPM (played "
+                              << exact_beats << " beats) -> "
+                              << (static_cast<float>(ideal_length) / config_.sample_rate) << "s" << std::endl;
+                } else {
+                    // --- מצב AUTO: קצב מאומד + הצמדת-פרייז עם רצועת חצי-פעימה ---
+                    size_t last_onset_samples = 0;
+                    float beat_length = extract_beat_length_from_onsets(
+                        recorded_audio, static_cast<size_t>(actual_playing_samples), &last_onset_samples);
+                    float exact_beats = actual_playing_samples / beat_length;
+                    float last_onset_beats = static_cast<float>(last_onset_samples) / beat_length;
+                    float target_musical_beats = quantize_to_musical_phrase(exact_beats);
+                    loop_beats_.store(target_musical_beats, std::memory_order_relaxed);   // רשת ה-UI
+                    float quantized_length = target_musical_beats * beat_length;
+                    float deviation = std::abs(quantized_length - actual_playing_samples);
+                    bool grid_accepted = (deviation <= 0.6f * beat_length);
+                    ideal_length = static_cast<size_t>(
+                        grid_accepted ? quantized_length : actual_playing_samples);
+                    std::cout << "[DSP] Loop assembly: beat=" << (beat_length / config_.sample_rate)
+                              << "s (" << estimated_bpm_.load(std::memory_order_relaxed) << " BPM)"
+                              << " playing=" << (actual_playing_samples / config_.sample_rate)
+                              << "s exact_beats=" << exact_beats
+                              << " last_onset_beats=" << last_onset_beats
+                              << " -> " << target_musical_beats
+                              << " grid=" << (grid_accepted ? "ACCEPTED" : "REJECTED")
+                              << " final=" << (static_cast<float>(ideal_length) / config_.sample_rate) << "s" << std::endl;
+                }
 
                 std::vector<float> final_loop;
                 final_loop.reserve(ideal_length);
@@ -897,6 +1027,30 @@ void LooperEngine::process_audio_asynchronously() {
             }
 
             case LooperState::LOOPING: {
+                // --- אפקטים חיים על הלופ (Reverse / Octave) ---
+                int fx = request_effect_.load(std::memory_order_relaxed);
+                if (fx != 0) {
+                    int slot = acquire_writable_slot();   // רק כשהקורא נצפה (בטיחות RCU)
+                    if (slot >= 0) {
+                        request_effect_.store(0, std::memory_order_relaxed);
+                        std::vector<float> src;
+                        {
+                            std::lock_guard<std::mutex> lock(buffer_mutex_);
+                            src = playback_buffers_[active_playback_idx_.load(std::memory_order_relaxed)];
+                        }
+                        std::vector<float> transformed = apply_loop_effect(src, fx);
+                        if (!transformed.empty()) {
+                            {
+                                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                                playback_buffers_[slot] = std::move(transformed);
+                            }
+                            playback_read_idx_.store(0, std::memory_order_relaxed);
+                            active_playback_idx_.store(slot, std::memory_order_release);
+                            if (fx != 1) loop_beats_.store(0.0f, std::memory_order_relaxed); // אוקטבה משנה אורך → רשת לא תקפה
+                        }
+                    }
+                }
+
                 if (request_overdub_.exchange(false, std::memory_order_relaxed)) {
                     // כניסה לאוברדאב: מעתיקים את הלופ החי לסקראץ' פרטי של ה-Worker.
                     // כל הכתיבות יקרו בסקראץ' — לעולם לא בחוצץ שהרמקול קורא ממנו.
@@ -1017,8 +1171,34 @@ bool LooperEngine::export_to_wav(const char* filepath) {
         return false;
     }
 
-    // הגדרת המקודד: WAV, 32-bit Float, Mono, קצב הדגימה של המנוע
-    ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, ma_format_f32, 1, config_.sample_rate);
+    // אפקטי Reverse/Octave כבר צרובים בחוצץ (הרסניים). את הריברב — שלב Output
+    // חי ולא-הרסני — צורבים כאן אם פעיל, כדי שה-Export יישמע כמו ההשמעה. מחממים
+    // את הריברב למצב יציב (מריצים את הלופ שוב ושוב) כדי שהזנב יעטוף את התפר
+    // וייצא לופ רציף, ואז מקליטים סיבוב אחד של רטוב+יבש.
+    if (reverb_enabled_.load(std::memory_order_relaxed)) {
+        FreeverbMono rv;
+        rv.init(config_.sample_rate);
+        rv.set_params(REVERB_ROOM, REVERB_DAMP);
+        size_t loop_n = snapshot.size();
+        size_t warm_target = std::max(static_cast<size_t>(3.0f * config_.sample_rate), loop_n);
+        for (size_t warmed = 0; warmed < warm_target; warmed += loop_n)
+            for (size_t i = 0; i < loop_n; ++i) rv.process(snapshot[i]);   // חימום (תוצאה נזרקת)
+        std::vector<float> wet_loop(loop_n);
+        for (size_t i = 0; i < loop_n; ++i) {
+            float wet = rv.process(snapshot[i]);
+            wet_loop[i] = std::clamp(snapshot[i] + wet * REVERB_WET, -1.0f, 1.0f);
+        }
+        snapshot = std::move(wet_loop);
+    }
+
+    // ייצוא כ-PCM 16-bit: פורמט האודיו האוניברסלי. WAV IEEE-float (הפורמט הקודם)
+    // אינו מזוהה תמיד כאודיו על-ידי סורק המדיה של אנדרואיד → הקובץ "נעלם" מבוררי
+    // הקבצים המבוססי-MediaStore ולא ניתן לבחור אותו. 16-bit נתמך בכל מקום, חצי
+    // גודל, וללא אובדן איכות נשמע לגיטרה.
+    std::vector<ma_int16> pcm16(snapshot.size());
+    ma_pcm_f32_to_s16(pcm16.data(), snapshot.data(), snapshot.size(), ma_dither_mode_triangle);
+
+    ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, config_.sample_rate);
     ma_encoder encoder;
 
     if (ma_encoder_init_file(filepath, &config, &encoder) != MA_SUCCESS) {
@@ -1027,7 +1207,7 @@ bool LooperEngine::export_to_wav(const char* filepath) {
     }
 
     // שפיכת הזיכרון לקובץ
-    ma_encoder_write_pcm_frames(&encoder, snapshot.data(), snapshot.size(), nullptr);
+    ma_encoder_write_pcm_frames(&encoder, pcm16.data(), pcm16.size(), nullptr);
     ma_encoder_uninit(&encoder);
 
     std::cout << "[I/O] Successfully exported loop to: " << filepath << std::endl;
@@ -1057,6 +1237,10 @@ bool LooperEngine::import_from_wav(const char* filepath) {
 
     // החלת אלגוריתם ה-Crossfade על הקובץ המיובא כדי להבטיח לופ מושלם ללא קליקים דיגיטליים
     loaded_audio = apply_zero_crossing_crossfade(loaded_audio, 256);
+
+    // אין רשת פעימות לאודיו מיובא שרירותי — לא הרצנו עליו אומדן קצב.
+    loop_beats_.store(0.0f, std::memory_order_relaxed);
+    estimated_bpm_.store(0.0f, std::memory_order_relaxed);
 
     // --- מסירה ל-Worker במקום פרסום ישיר ---
     // רק ה-Worker רשאי לפרסם חוצצים: פרסום משני Threads שובר את מודל ה-RCU

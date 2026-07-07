@@ -7,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <cmath>
+#include <algorithm>
 
 enum class LooperState {
     CALIBRATING,
@@ -44,6 +45,54 @@ inline float mix_and_soft_clip(float existing_sample, float new_sample) {
     float compressed = KNEE + (1.0f - KNEE) * (over / (over + (1.0f - KNEE)));
     return sum > 0.0f ? compressed : -compressed;
 }
+
+// ריברב Freeverb מונו (Schroeder/Moorer): 8 מסנני-מסרק מרוסנים במקביל אל תוך
+// 4 מסנני All-pass בטור. זול, מוזיקלי, זמן-אמת. נוגעים בו רק ב-Thread של ה-Output;
+// הפרמטרים דרך atomics במנוע. מכוון ל-44.1k — סטיית ~9% ב-48k בלתי-נשמעת.
+struct FreeverbMono {
+    static constexpr int NC = 8;
+    static constexpr int NA = 4;
+    std::vector<float> comb_[NC];
+    std::vector<float> ap_[NA];
+    int ci_[NC] = {0};
+    int ai_[NA] = {0};
+    float store_[NC] = {0};
+    float feedback_ = 0.84f, damp1_ = 0.2f, damp2_ = 0.8f;
+    static constexpr float AP_FB = 0.5f;
+    static constexpr float GAIN = 0.015f;
+
+    void init(int sr) {
+        static const int cd[NC] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+        static const int ad[NA] = {556, 441, 341, 225};
+        float scale = static_cast<float>(sr) / 44100.0f;
+        for (int i = 0; i < NC; i++) { comb_[i].assign(std::max(1, (int)(cd[i] * scale)), 0.0f); ci_[i] = 0; store_[i] = 0; }
+        for (int i = 0; i < NA; i++) { ap_[i].assign(std::max(1, (int)(ad[i] * scale)), 0.0f); ai_[i] = 0; }
+    }
+    void set_params(float room, float damp) {
+        feedback_ = 0.70f + 0.28f * room;   // room 0..1 -> feedback 0.70..0.98
+        damp1_ = damp * 0.5f;               // damp 0..1
+        damp2_ = 1.0f - damp1_;
+    }
+    inline float process(float in) {
+        float input = in * GAIN;
+        float out = 0.0f;
+        for (int i = 0; i < NC; i++) {
+            float y = comb_[i][ci_[i]];
+            store_[i] = y * damp2_ + store_[i] * damp1_;   // lowpass in the feedback path
+            comb_[i][ci_[i]] = input + store_[i] * feedback_;
+            if (++ci_[i] >= (int)comb_[i].size()) ci_[i] = 0;
+            out += y;
+        }
+        for (int i = 0; i < NA; i++) {
+            float bo = ap_[i][ai_[i]];
+            float y = bo - out;                            // -out + bufout
+            ap_[i][ai_[i]] = out + bo * AP_FB;
+            if (++ai_[i] >= (int)ap_[i].size()) ai_[i] = 0;
+            out = y;
+        }
+        return out;
+    }
+};
 
 // טלמטריה פר-צ'אנק עבור ה-Harness האופליין (כוונון אמפירי).
 // במכשיר ה-Sink נשאר null והעלות היא בדיקת מצביע אחת לצ'אנק.
@@ -132,6 +181,7 @@ private:
     std::atomic<bool> request_overdub_{false};
     std::atomic<bool> request_looping_{false};
     std::atomic<bool> request_clear_{false};
+    std::atomic<int>  request_effect_{0};   // 0=none 1=reverse 2=octave-up 3=octave-down
 
     // בקשות קונפיגורציית חומרה: נרשמות כאן, מוחלות אך ורק על-ידי ה-Worker
     std::atomic<int> pending_sample_rate_{-1};
@@ -142,6 +192,7 @@ private:
     std::atomic<bool> has_pending_import_{false};
 
     std::atomic<float> estimated_bpm_{0.0f};
+    std::atomic<float> loop_beats_{0.0f};   // מס' הפעימות בלופ הנוכחי (לרשת ה-UI)
 
     // [חדש] שמירת אונטולוגיית הזיהוי (0=Auto, 1=Tap, 2=BPM)
     std::atomic<int> detection_mode_{0};
@@ -183,11 +234,29 @@ private:
                                           size_t* last_onset_samples = nullptr);
     float quantize_to_musical_phrase(float raw_beats);
     std::vector<float> apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples = 256);
+    std::vector<float> apply_loop_effect(const std::vector<float>& src, int fx);
     void process_audio_asynchronously();
 
     // מנגנון סינון תדרים לטריגר בלבד (Worker-thread בלבד)
     float pre_emphasis_state_{0.0f};
     float calculate_trigger_rms(const std::vector<float>& chunk);
+
+    // --- מטרונום / Count-in (מצב SYNC) ---
+    // נשמע ב-IDLE (ספירה-לתוך + נעילת קצב) וב-LOOPING/OVERDUBBING (סנכרון אוברדאב),
+    // אך *שותק בזמן RECORDING* — הקליק דולף מהרמקול למיקרופון, וקליקים מחזוריים
+    // היו מזהמים גם את ההקלטה וגם את זיהוי השקט. מצב הקליק נוגע רק ב-Thread של
+    // ה-Output (process_output_callback), הפרמטרים אטומיים.
+    std::atomic<bool> metronome_user_enabled_{true};
+    // ריברב על ה-Output (לא-הרסני): הלופ המוקלט נשאר יבש; הרטוב מתווסף בנגינה בלבד
+    std::atomic<bool> reverb_enabled_{false};
+    FreeverbMono reverb_;
+    double metro_free_counter_{0.0};   // מונה חופשי (IDLE); בנגינה נעול למיקום הלופ
+    long   metro_last_beat_{-1};
+    float  click_env_{0.0f};
+    double click_phase_{0.0};
+    float  click_freq_{1000.0f};
+    void render_metronome(float* out, size_t num_frames, LooperState state,
+                          bool playing, size_t loop_pos, size_t loop_size);
 
     // Sink טלמטריה אופציונלי (Harness בלבד; null במכשיר)
     std::atomic<TelemetrySink> telemetry_sink_{nullptr};
@@ -224,6 +293,7 @@ public:
     DynamicThresholdTracker& get_raw_noise_tracker() { return raw_noise_tracker_; }
 
     float get_estimated_bpm() const;
+    float get_loop_beats() const;
     float get_loop_position() const;
 
     bool export_to_wav(const char* filepath);
@@ -250,4 +320,18 @@ public:
     void set_target_bpm(float bpm) {
         target_bpm_.store(bpm, std::memory_order_relaxed);
     }
+
+    void set_metronome_enabled(bool on) {
+        metronome_user_enabled_.store(on, std::memory_order_relaxed);
+    }
+
+    void set_reverb_enabled(bool on) {
+        reverb_enabled_.store(on, std::memory_order_relaxed);
+    }
+
+    // אפקטים חיים על הלופ (0=none 1=reverse 2=octave-up 3=octave-down). מוחל
+    // על-ידי ה-Worker (מפרסם יחיד) כדי לשמור על מודל ה-RCU.
+    void request_effect(int fx) { request_effect_.store(fx, std::memory_order_relaxed); }
+    // צילום מעטפת גל של הלופ הפעיל ל-bins שווים (Peak לכל bin). מוחזר מס' ה-bins.
+    int get_loop_waveform(float* out, int max_bins);
 };

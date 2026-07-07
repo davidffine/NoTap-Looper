@@ -97,6 +97,14 @@ Java_com_notap_looper_AudioEngine_getEstimatedBPM(JNIEnv *env, jobject thiz) {
 }
 
 JNIEXPORT jfloat JNICALL
+Java_com_notap_looper_AudioEngine_getLoopBeats(JNIEnv *env, jobject thiz) {
+    if (g_engine) {
+        return g_engine->get_loop_beats();
+    }
+    return 0.0f;
+}
+
+JNIEXPORT jfloat JNICALL
 Java_com_notap_looper_AudioEngine_getLoopPosition(JNIEnv *env, jobject thiz) {
     if (g_engine) {
         return g_engine->get_loop_position();
@@ -133,6 +141,34 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setTargetBPM(JNIEnv *en
     if (g_engine) {
         g_engine->set_target_bpm(bpm);
     }
+}
+
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setMetronomeEnabled(JNIEnv *env, jobject thiz, jboolean on) {
+    if (g_engine) {
+        g_engine->set_metronome_enabled(on == JNI_TRUE);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_applyLoopEffect(JNIEnv *env, jobject thiz, jint effect) {
+    if (g_engine) {
+        g_engine->request_effect(effect);
+    }
+}
+
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setReverbEnabled(JNIEnv *env, jobject thiz, jboolean on) {
+    if (g_engine) {
+        g_engine->set_reverb_enabled(on == JNI_TRUE);
+    }
+}
+
+JNIEXPORT jint JNICALL Java_com_notap_looper_AudioEngine_getLoopWaveform(JNIEnv *env, jobject thiz, jfloatArray out) {
+    if (!g_engine || out == nullptr) return 0;
+    jsize len = env->GetArrayLength(out);
+    if (len <= 0) return 0;
+    jfloat* buf = env->GetFloatArrayElements(out, nullptr);
+    int bins = g_engine->get_loop_waveform(buf, static_cast<int>(len));
+    env->ReleaseFloatArrayElements(out, buf, 0);
+    return bins;
 }
 
 }
