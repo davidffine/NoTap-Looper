@@ -252,7 +252,7 @@ private:
     float extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples,
                                           size_t* last_onset_samples = nullptr);
     float quantize_to_musical_phrase(float raw_beats);
-    std::vector<float> apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples = 256);
+    std::vector<float> apply_seam_fold(std::vector<float>& audio, size_t fold_samples = 2048);
     std::vector<float> apply_loop_effect(const std::vector<float>& src, int fx);
     void process_audio_asynchronously();
 

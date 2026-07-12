@@ -1,4 +1,5 @@
 #include "../headers/LooperEngine.hpp"
+#include "../headers/OctaveResample.hpp"
 #include "../includes/kissfft/kiss_fftr.h"
 #include "../headers/miniaudio.h"
 #include <iostream>
@@ -498,21 +499,40 @@ void LooperEngine::execute_record_stop_command() {
     request_record_stop_.store(true, std::memory_order_relaxed);
 }
 
-std::vector<float> LooperEngine::apply_zero_crossing_crossfade(std::vector<float>& audio, size_t crossfade_samples) {
-    if (audio.size() <= crossfade_samples * 2) return audio;
-    size_t len = audio.size();
-    std::vector<float> result = audio;
-    size_t best_end = len - 1;
-    for (size_t i = len - 1; i > len - crossfade_samples; --i) {
-        if (audio[i] * audio[i-1] <= 0.0f) { best_end = i; break; }
+// תפר קצה→ראש בקיפול — אותו עיקרון כמו קיפול-הזנב של PROCESSING שנמדד נקי,
+// אבל עם שני לקחים שנמדדו ביוקר על חיתוך TAP באמצע נגינה חזקה:
+//  (1) המשך חייב להיות *ארוך* — קיפול 256 דגימות (5.8ms) של תוכן חזק אל ראש
+//      שקט = פרץ רחב-סרט (נמדד: click_ratio 18 — גרוע מה-Fade-לאפס הישן, 4.6).
+//      2048 דגימות (~43ms) קוראות באוזן כדעיכה מוזיקלית, ועדיין מתחת לדיוק
+//      התזמון האנושי של ההקשה (הקיצור הדטרמיניסטי נבלע ברעש המשתמש).
+//  (2) הדעיכה בצורת קוסינוס — נגזרת אפס בשני קצוות ה-Fade; שיפוע לינארי
+//      פותח ב"ברך" שמרוחה כאנרגיה רחבת-סרט.
+// שומר-הרציפות מדלג על כל טיפול כשהתפר כבר רציף (לופ מיובא מוכן — הישן
+// היה הורס אותו עם Fade-לאפס).
+std::vector<float> LooperEngine::apply_seam_fold(std::vector<float>& audio, size_t fold_samples) {
+    if (audio.size() <= fold_samples * 4) return audio;
+    const size_t N = audio.size();
+
+    // שומר רציפות: אם קפיצת התפר אינה חריגה מצעד טיפוסי בין דגימות סמוכות
+    // בסביבת התפר — הלופ כבר חלק; כל טיפול רק יזיק.
+    {
+        const size_t G = 1024;
+        double mean_step = 0.0;
+        for (size_t i = 0; i < G; ++i) {
+            mean_step += std::abs(audio[i + 1] - audio[i]);                  // ראש
+            mean_step += std::abs(audio[N - 1 - i] - audio[N - 2 - i]);      // זנב
+        }
+        mean_step /= (2.0 * G);
+        if (std::abs(audio[0] - audio[N - 1]) <= 3.0 * mean_step + 1e-6) return audio;
     }
-    result.resize(best_end + 1);
-    len = result.size();
+
     const float PI = 3.14159265358979323846f;
-    for (size_t i = 0; i < crossfade_samples; ++i) {
-        float progress = static_cast<float>(i) / static_cast<float>(crossfade_samples);
-        float fade_out = 0.5f * (1.0f + std::cos(progress * PI));
-        result[len - crossfade_samples + i] *= fade_out;
+    const size_t cut = N - fold_samples;
+    std::vector<float> result(audio.begin(), audio.begin() + cut);
+    for (size_t i = 0; i < fold_samples; ++i) {
+        float progress = static_cast<float>(i) / static_cast<float>(fold_samples);
+        float fade = 0.5f * (1.0f + std::cos(progress * PI));   // 1→0, נגזרת אפס בקצוות
+        result[i] = std::clamp(result[i] + audio[cut + i] * fade, -1.0f, 1.0f);
     }
     return result;
 }
@@ -520,30 +540,23 @@ std::vector<float> LooperEngine::apply_zero_crossing_crossfade(std::vector<float
 std::vector<float> LooperEngine::apply_loop_effect(const std::vector<float>& src, int fx) {
     std::vector<float> dst;
     if (src.empty()) return dst;
-    auto lerp = [&](double pos) -> float {
-        if (pos <= 0.0) return src.front();
-        size_t i = static_cast<size_t>(pos);
-        if (i + 1 >= src.size()) return src.back();
-        float f = static_cast<float>(pos - i);
-        return src[i] * (1.0f - f) + src[i + 1] * f;
-    };
+    // אין שום טיפול-תפר אחרי הטרנספורמציות — בכוונה:
+    //  Reverse משמר רציפות תפר (ההיפוך של תפר רציף הוא תפר רציף) ולכן נשאר
+    //  באורך *מדויק* (הקיפול הישן קיצר אותו ב-256 ושבר את הבטחת הסנכרון);
+    //  האוקטבות מסוננות *מעגלית* (ראה OctaveResample.hpp) — הלופ הוא מעגל,
+    //  והסינון המעגלי משמר את רציפות התפר של המקור מתמטית.
     switch (fx) {
-        case 1: // reverse — same length, stays in sync
+        case 1: // reverse — אורך זהה, נשאר בסנכרון
             dst.assign(src.rbegin(), src.rend());
             break;
-        case 2: { // octave up — read at 2× (higher pitch, half length)
-            dst.resize(src.size() / 2);
-            for (size_t i = 0; i < dst.size(); ++i) dst[i] = lerp(i * 2.0);
+        case 2: // octave up — חצי-סרט מעגלי + דצימציה ×2 (חצי אורך)
+            dst = notap_dsp::octave_up(src);
             break;
-        }
-        case 3: { // octave down — read at 0.5× (lower pitch, double length)
-            dst.resize(src.size() * 2);
-            for (size_t i = 0; i < dst.size(); ++i) dst[i] = lerp(i * 0.5);
+        case 3: // octave down — אינטרפולטור חצי-סרט מעגלי (כפול אורך)
+            dst = notap_dsp::octave_down(src);
             break;
-        }
         default: return dst;
     }
-    dst = apply_zero_crossing_crossfade(dst, 256);   // clean seam after transform
     return dst;
 }
 
@@ -1092,11 +1105,11 @@ void LooperEngine::process_audio_asynchronously() {
                     tail_folded = true;
                 }
 
-                // Crossfade קצה מופעל רק כשאין זנב מקופל: הוא משנה את אורך הלופ
-                // (עד 256 דגימות — סחיפת טמפו מצטברת) ומאפס את הקצה, מה ששובר את
-                // רציפות התפר שהקיפול כבר מבטיח. עם קיפול — התפר רציף מעצם הבנייה.
+                // קיפול-קצה מופעל רק כשאין זנב מקופל (TAP / ריפוד): עם זנב — התפר
+                // רציף מעצם הבנייה. שומר-הרציפות שבתוך apply_seam_fold מדלג ממילא
+                // כשהקצה כבר חלק (למשל ריפוד אפסים אל ראש שקט).
                 if (!tail_folded) {
-                    final_loop = apply_zero_crossing_crossfade(final_loop, 256);
+                    final_loop = apply_seam_fold(final_loop);
                 }
 
                 if (!final_loop.empty()) {
@@ -1331,8 +1344,9 @@ bool LooperEngine::import_from_wav(const char* filepath) {
     if (frames_read == 0) return false;
     loaded_audio.resize(frames_read); // הידוק הזיכרון במקרה של שגיאת אורך
 
-    // החלת אלגוריתם ה-Crossfade על הקובץ המיובא כדי להבטיח לופ מושלם ללא קליקים דיגיטליים
-    loaded_audio = apply_zero_crossing_crossfade(loaded_audio, 256);
+    // קיפול-קצה על קובץ מיובא *רק אם תפרו אינו רציף* (שומר-הרציפות שבפנים):
+    // לופ מוכן-מראש עובר ללא נגיעה; חיתוך גס מקבל תפר בסגנון הקיפול שנמדד נקי.
+    loaded_audio = apply_seam_fold(loaded_audio);
 
     // אין רשת פעימות לאודיו מיובא שרירותי — לא הרצנו עליו אומדן קצב.
     loop_beats_.store(0.0f, std::memory_order_relaxed);
