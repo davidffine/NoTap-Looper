@@ -297,8 +297,9 @@ size_t LooperEngine::find_true_onset(const std::vector<float>& audio_data, size_
     return 0;
 }
 
-// פונקציית ה-novelty החדשה, המבוססת על Frequency-Domain
-std::vector<float> LooperEngine::extract_novelty_curve(const std::vector<float>& audio_data, int env_sr, int& out_chunk_size) {
+// עקומת Novelty במרחב התדר (Spectral Flux על חלונות קופצים) — משמשת את
+// אומדן הטמפו בלבד. (ה-Flux הזורם פר-צ'אנק הוסר: נמדד ונפסל כמבחין התקף.)
+std::vector<float> LooperEngine::extract_novelty_curve(const std::vector<float>& audio_data, int& out_chunk_size) {
     // גודל חלון ה-FFT. קובע את הרזולוציה בתדר מול הזמן.
     const int NFFT = 1024;
     const int HOP_SIZE = NFFT / 2; // חפיפה של 50%
@@ -398,7 +399,7 @@ float LooperEngine::extract_beat_length_from_onsets(const std::vector<float>& au
     // Novelty רק על הקטע המוזיקלי (זנב הד/שקט מדלל את הקורלציה)
     std::vector<float> segment(audio_data.begin(), audio_data.begin() + analysis_samples);
     int hop = 0;
-    std::vector<float> novelty = extract_novelty_curve(segment, 0, hop);
+    std::vector<float> novelty = extract_novelty_curve(segment, hop);
     if (hop == 0 || novelty.size() < 32) return give_up();
     const int N = static_cast<int>(novelty.size());
 
@@ -626,46 +627,6 @@ void LooperEngine::process_audio_asynchronously() {
     const float ENV_RELEASE_SECONDS = 1.5f;   // קבוע הזמן של שחרור המעטפת (טלמטריה)
     const float MAX_RECORD_SECONDS = 300.0f;  // רשת ביטחון נגד הקלטה אינסופית
 
-    // --- Spectral Flux זורם (novelty בזמן-אמת) ---
-    // רץ על ה-Worker (לא על ה-Thread של Oboe), ולכן הקצאת KissFFT מותרת.
-    // חלון 1024 עם hop של צ'אנק בודד; Flux = סכום ההפרשים החיוביים במגניטודה
-    // מול המסגרת הקודמת (Half-wave rectified). מזהה תו חדש לפי *חידוש ספקטרלי*
-    // ולא לפי אנרגיה גולמית — לכן רגיש לפריטת מיתר E דק גם ברמה נמוכה.
-    const int FLUX_NFFT = 1024;
-    const float PI_F = 3.14159265358979323846f;
-    kiss_fftr_cfg flux_cfg = kiss_fftr_alloc(FLUX_NFFT, 0, nullptr, nullptr);
-    std::vector<kiss_fft_scalar> flux_time_in(FLUX_NFFT, 0.0f);
-    std::vector<kiss_fft_cpx> flux_freq_out(FLUX_NFFT / 2 + 1);
-    std::vector<float> flux_prev_mag(FLUX_NFFT / 2 + 1, 0.0f);
-    std::vector<float> flux_window(FLUX_NFFT);
-    for (int j = 0; j < FLUX_NFFT; ++j)
-        flux_window[j] = 0.5f * (1.0f - std::cos(2.0f * PI_F * j / (FLUX_NFFT - 1)));
-    std::vector<float> flux_ring(FLUX_NFFT, 0.0f);   // חלון גולל של NFFT הדגימות האחרונות
-
-    auto compute_flux = [&](const std::vector<float>& chunk) -> float {
-        // דחיפת הצ'אנק החדש ושמירת NFFT הדגימות האחרונות
-        flux_ring.insert(flux_ring.end(), chunk.begin(), chunk.end());
-        if (flux_ring.size() > static_cast<size_t>(FLUX_NFFT))
-            flux_ring.erase(flux_ring.begin(), flux_ring.end() - FLUX_NFFT);
-        for (int j = 0; j < FLUX_NFFT; ++j) flux_time_in[j] = flux_ring[j] * flux_window[j];
-        kiss_fftr(flux_cfg, flux_time_in.data(), flux_freq_out.data());
-        float flux = 0.0f;
-        for (int k = 0; k <= FLUX_NFFT / 2; ++k) {
-            float mag = std::sqrt(flux_freq_out[k].r * flux_freq_out[k].r +
-                                  flux_freq_out[k].i * flux_freq_out[k].i);
-            float diff = mag - flux_prev_mag[k];
-            if (diff > 0.0f) flux += diff;      // Half-wave rectification
-            flux_prev_mag[k] = mag;
-        }
-        return flux;
-    };
-
-    // סף Flux אדפטיבי: חציון + k·MAD על היסטוריית ה-Flux האחרונה (חסין לספייקים).
-    std::vector<float> flux_hist(64, 0.0f);
-    size_t flux_hist_idx = 0;
-    float current_flux = 0.0f;
-    float current_flux_threshold = 0.0f;
-
     // --- שער המחזוריות (YIN) ---
     // רץ על חלון 2048 הדגימות האחרונות של ה-Preroll — עמוק בתוך התהודה, אחרי
     // ההתקף (persistence 12 ≈ 6144 דגימות זמינות). f0 בטווח 70Hz-1kHz מכסה
@@ -799,21 +760,7 @@ void LooperEngine::process_audio_asynchronously() {
         float trigger_volume = calculate_trigger_rms(local_chunk);
         current_yin = -1.0f;   // יחושב רק בצ'אנקים של רצף/החלטה
 
-        // Spectral Flux זורם — כלי מדידה אופליין בלבד. המדידה הוכיחה שה-Flux
-        // *אינו* מבחין נקי (טרנזיינט AC/נקישה מייצר Flux בגובה פריטה רכה, וה-Flux
-        // גדל עם עוצמה), ולכן איננו מזהה ההתקף הראשי. מחשבים אותו רק כשה-Sink פעיל
-        // כדי לא לשלם FFT לכל צ'אנק במכשיר לחינם.
         bool telemetry_active = (telemetry_sink_.load(std::memory_order_relaxed) != nullptr);
-        if (telemetry_active) {
-            current_flux = compute_flux(local_chunk);
-            std::vector<float> sorted(flux_hist);
-            std::sort(sorted.begin(), sorted.end());
-            float median = sorted[sorted.size() / 2];
-            float mad_sum = 0.0f;
-            for (float v : sorted) mad_sum += std::abs(v - median);
-            float mad = mad_sum / sorted.size();
-            current_flux_threshold = median + 4.0f * mad;
-        }
 
         current_rms_.store(raw_volume, std::memory_order_relaxed);
         current_noise_std_dev_.store(noise_tracker_.get_std_dev(), std::memory_order_relaxed);
@@ -1234,27 +1181,16 @@ void LooperEngine::process_audio_asynchronously() {
             t.noise_std_trigger = noise_tracker_.get_std_dev();
             t.noise_mean_raw = raw_noise_tracker_.get_mean();
             t.noise_std_raw = raw_noise_tracker_.get_std_dev();
-            t.spectral_flux = current_flux;
-            t.flux_threshold = current_flux_threshold;
             t.yin_confidence = current_yin;
             t.published_loop_samples = last_published_loop_samples;
             last_published_loop_samples = 0;   // מדווח פעם אחת, בצ'אנק הפרסום
             sink(t, telemetry_user_.load(std::memory_order_relaxed));
         }
 
-        // עדכון היסטוריית ה-Flux לסף האדפטיבי (אופליין בלבד, כשה-Sink פעיל)
-        if (telemetry_active &&
-            (current_flux < current_flux_threshold || current_flux_threshold == 0.0f)) {
-            flux_hist[flux_hist_idx] = current_flux;
-            flux_hist_idx = (flux_hist_idx + 1) % flux_hist.size();
-        }
-
-        // נקודת הייחוס של ה-Flux לצ'אנק הבא
+        // נקודת הייחוס של מבחן העלייה לצ'אנק הבא
         prev_trigger_volume = trigger_volume;
         local_chunk.clear();
     }
-
-    kiss_fftr_free(flux_cfg);
 }
 
 size_t LooperEngine::feed_audio_offline(const float* data, size_t num_samples) {

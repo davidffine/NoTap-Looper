@@ -20,17 +20,11 @@ enum class LooperState {
 
 std::string state_to_string(LooperState state);
 
-enum class LooperMode {
-    RHYTHMIC_GRID,
-    CIRCULAR_REPETITION
-};
-
 struct EngineConfig {
     int sample_rate = 44100;
     int chunk_size = 512;
     float preroll_seconds = 0.15f;
     float silence_duration = 0.8f;
-    LooperMode mode = LooperMode::RHYTHMIC_GRID;
 };
 
 // מיקס אוברדאב עם ברך רכה: לינארי לחלוטין עד KNEE, דחיסה אסימפטוטית ל-±1.0 מעליו.
@@ -113,8 +107,6 @@ struct ChunkTelemetry {
     float noise_std_trigger;
     float noise_mean_raw;
     float noise_std_raw;
-    float spectral_flux;          // [חדש] Spectral Flux זורם (novelty פר-צ'אנק)
-    float flux_threshold;         // [חדש] הסף האדפטיבי של ה-Flux (חציון + k·MAD)
     size_t published_loop_samples; // [חדש] אורך לופ שפורסם בצ'אנק זה (0 אם לא פורסם)
     float yin_confidence;         // [חדש] מובהקות מחזוריות YIN בחלון ההחלטה (-1 = לא חושב)
 };
@@ -248,7 +240,7 @@ private:
 
     float calculate_rms(const std::vector<float>& chunk);
     size_t find_true_onset(const std::vector<float>& audio_data, size_t max_search_samples, float threshold);
-    std::vector<float> extract_novelty_curve(const std::vector<float>& audio_data, int env_sr, int& out_chunk_size);
+    std::vector<float> extract_novelty_curve(const std::vector<float>& audio_data, int& out_chunk_size);
     float extract_beat_length_from_onsets(const std::vector<float>& audio_data, size_t analysis_samples,
                                           size_t* last_onset_samples = nullptr);
     float quantize_to_musical_phrase(float raw_beats);
