@@ -155,9 +155,9 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_applyLoopEffect(JNIEnv 
     }
 }
 
-JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setReverbEnabled(JNIEnv *env, jobject thiz, jboolean on) {
+JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setReverbWet(JNIEnv *env, jobject thiz, jfloat wet) {
     if (g_engine) {
-        g_engine->set_reverb_enabled(on == JNI_TRUE);
+        g_engine->set_reverb_wet(wet);
     }
 }
 

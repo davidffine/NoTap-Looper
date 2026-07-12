@@ -12,11 +12,11 @@
 #include <pmmintrin.h>
 #endif
 
-// פרמטרי הריברב — מקור אמת יחיד, כדי שהעיבוד החי וה-Bake ל-Export יישמעו זהים.
+// פרמטרי הריברב — מקור אמת יחיד. כמות הרטוב (WET) נשלטת בזמן-אמת ע"י הכפתור
+// (reverb_wet_ במנוע); הטווח והריסון קבועים.
 namespace {
     constexpr float REVERB_ROOM = 0.72f;
     constexpr float REVERB_DAMP = 0.45f;
-    constexpr float REVERB_WET  = 0.55f;
 }
 
 // FTZ/DAZ הם מצב של רגיסטר ה-FP *של ה-Thread הנוכחי*.
@@ -37,6 +37,33 @@ static void enable_denormal_flush_to_zero() {
     fpscr |= (1u << 24);    // FZ: Flush-to-Zero
     __asm__ __volatile__("vmsr fpscr, %0" : : "r"(fpscr));
 #endif
+}
+
+// מובהקות מחזוריות YIN (CMND): 1 = מחזורי לחלוטין, 0 = א-מחזורי.
+// סקאלה-אינווריאנטי מתמטית — הכפלת האות ב-g מתבטלת ביחס d(τ)·τ/Σd, ולכן זהו
+// המבחין היחיד שאינו תלוי ברגישות המיקרופון/עוצמת הכניסה. d(τ) מנורמל
+// פר-דגימה כי טווח האינטגרציה מתכווץ עם τ בחלון קבוע.
+static float yin_periodicity(const float* x, int W, int tau_min, int tau_max) {
+    if (tau_max >= W - 1) tau_max = W - 2;
+    if (tau_min < 2) tau_min = 2;
+    if (tau_min >= tau_max || W < 64) return 0.0f;
+    float best = 1.0f;
+    double running = 0.0;
+    for (int tau = 1; tau <= tau_max; ++tau) {
+        double d = 0.0;
+        const int span = W - tau;
+        for (int i = 0; i < span; ++i) {
+            float diff = x[i] - x[i + tau];
+            d += static_cast<double>(diff) * diff;
+        }
+        d /= span;
+        running += d;
+        if (tau >= tau_min && running > 1e-30) {
+            float cmnd = static_cast<float>(d * tau / running);
+            if (cmnd < best) best = cmnd;
+        }
+    }
+    return 1.0f - best;
 }
 
 std::string state_to_string(LooperState state) {
@@ -86,8 +113,11 @@ void DynamicThresholdTracker::recalculate_statistics() {
         variance_sum += diff * diff;
     }
     current_std_dev_ = std::sqrt(variance_sum / count);
-    const float ABSOLUTE_MIN_NOISE = 0.0001f;
-    current_std_dev_ = std::max(current_std_dev_, ABSOLUTE_MIN_NOISE);
+    // רצפת ה-σ חייבת להיות *יחסית לממוצע*, לא קבוע מוחלט: הקבוע הקודם (1e-4)
+    // קיבע את סף ההתקף במכשיר חלש — ב-Gain×0.25 הסף נתקע ב-~0.0013 בעוד פריטה
+    // רכה מסוננת מגיעה רק ל-~0.0009-0.0014 → עיוורון מובנה (נמדד בקורפוס).
+    // mean×0.25 סוקל עם ה-Gain (אינווריאנטיות מדויקת); 1e-5 עוגן לחדר מת דיגיטלית.
+    current_std_dev_ = std::max({current_std_dev_, current_mean_ * 0.25f, 1e-5f});
 }
 
 bool DynamicThresholdTracker::is_ready() const { return is_buffer_full_ || write_idx_ > (history_capacity_ / 2); }
@@ -189,10 +219,11 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
 
     // ריברב על אות הלופ (רטוב מתווסף ליבש). מוחל לפני המטרונום כדי שהקליקים
     // יישארו יבשים וברורים. לא-הרסני: החוצץ המוקלט לא משתנה.
-    if (playing && reverb_enabled_.load(std::memory_order_relaxed)) {
+    float wet_amount = reverb_wet_.load(std::memory_order_relaxed);
+    if (playing && wet_amount > 0.001f) {
         for (size_t i = 0; i < num_frames; ++i) {
             float wet = reverb_.process(output_data[i]);
-            output_data[i] = std::clamp(output_data[i] + wet * REVERB_WET, -1.0f, 1.0f);
+            output_data[i] = std::clamp(output_data[i] + wet * wet_amount, -1.0f, 1.0f);
         }
     }
 
@@ -622,6 +653,24 @@ void LooperEngine::process_audio_asynchronously() {
     float current_flux = 0.0f;
     float current_flux_threshold = 0.0f;
 
+    // --- שער המחזוריות (YIN) ---
+    // רץ על חלון 2048 הדגימות האחרונות של ה-Preroll — עמוק בתוך התהודה, אחרי
+    // ההתקף (persistence 12 ≈ 6144 דגימות זמינות). f0 בטווח 70Hz-1kHz מכסה
+    // גיטרה בכל כיוונון סביר. עלות ~1.4M מכפלות *בנקודת החלטה בלבד* — זניח.
+    const int YIN_W = 2048;
+    std::vector<float> yin_win(YIN_W);
+    float current_yin = -1.0f;   // -1 = לא חושב בצ'אנק זה (טלמטריה)
+    auto compute_yin_from_preroll = [&]() -> float {
+        size_t W = std::min<size_t>(YIN_W, max_preroll_samples);
+        for (size_t i = 0; i < W; ++i) {
+            size_t idx = (preroll_write_idx_ + max_preroll_samples - W + i) % max_preroll_samples;
+            yin_win[i] = preroll_buffer_[idx];
+        }
+        int tau_min = std::max(2, config_.sample_rate / 1000);
+        int tau_max = std::max(tau_min + 8, config_.sample_rate / 70);
+        return yin_periodicity(yin_win.data(), static_cast<int>(W), tau_min, tau_max);
+    };
+
     auto recompute_time_constants = [&]() {
         float chunk_seconds = static_cast<float>(config_.chunk_size) / static_cast<float>(config_.sample_rate);
         env_release_coef = std::exp(-chunk_seconds / ENV_RELEASE_SECONDS);
@@ -735,6 +784,7 @@ void LooperEngine::process_audio_asynchronously() {
         // חישוב כפול: עוצמה פיזית גולמית (להקלטה ולתצוגה), ועוצמה מסוננת (להחלטה אלגוריתמית)
         float raw_volume = calculate_rms(local_chunk);
         float trigger_volume = calculate_trigger_rms(local_chunk);
+        current_yin = -1.0f;   // יחושב רק בצ'אנקים של רצף/החלטה
 
         // Spectral Flux זורם — כלי מדידה אופליין בלבד. המדידה הוכיחה שה-Flux
         // *אינו* מבחין נקי (טרנזיינט AC/נקישה מייצר Flux בגובה פריטה רכה, וה-Flux
@@ -795,10 +845,13 @@ void LooperEngine::process_audio_asynchronously() {
                     // שלב ב': מבחן תוחלת החיים (Sustain). מחפש מסת תהודה לאורך זמן.
                     // התהודה הגולמית נמדדת מול סטטיסטיקת הרעש *הגולמית* — השוואה מול
                     // הסטטיסטיקה המסוננת היא שגיאת יחידות (הסקאלות אינן ברות-השוואה).
-                    // הרצפה המוחלטת מנותקת מ-min_onset: היא המבחין העיקרי בין פריטה
-                    // (מסת מיתר ≥0.09) לטרנזיינט סביבתי (≤0.05), וכוילה אמפירית מול הקורפוס.
-                    float absolute_sustain_floor = raw_sustain_floor_.load(std::memory_order_relaxed);
-                    float sustain_threshold = std::max(raw_noise_tracker_.get_silence_threshold(), absolute_sustain_floor);
+                    // הסף יחסי-לרעש (mean×מכפלה) ולא מוחלט: רצפה מוחלטת קושרת את
+                    // הזיהוי לרגישות מיקרופון אחת. המבחין בין פריטה לטרנזיינט סביבתי
+                    // הוא משך (persistence) + מחזוריות (YIN) — לא רמה.
+                    float raw_mean = raw_noise_tracker_.get_mean();
+                    float sustain_threshold = std::max({raw_noise_tracker_.get_silence_threshold(),
+                                                        raw_mean * sustain_rel_mult_.load(std::memory_order_relaxed),
+                                                        raw_sustain_floor_.load(std::memory_order_relaxed)});
 
                     bool is_sustaining = (raw_volume > sustain_threshold);
 
@@ -809,9 +862,27 @@ void LooperEngine::process_audio_asynchronously() {
                     }
                 }
 
+                // מדידת YIN שוטפת לאורך הרצף — אופליין בלבד (איסוף התפלגויות לכוונון)
+                if (telemetry_active && current_onset_streak_ > 0) {
+                    current_yin = compute_yin_from_preroll();
+                }
+
                 // 2. קבלת החלטה
-                // המכונה תאשר הקלטה רק אם הרצף שרד 4 חלונות (התקף + 3 חלונות תהודה יציבים).
+                // המכונה תאשר הקלטה רק אם הרצף שרד את persistence החלונות במלואם.
                 bool auto_triggered = (mode != 1) && (current_onset_streak_ >= onset_persistence_target_.load(std::memory_order_relaxed));
+
+                // שער המחזוריות: רצף שעבר את מבחני הרמה והמשך אך אינו מחזורי — רעש
+                // רחב-סרט מתמשך (קומפרסור/חבטה מהדהדת), לא מיתר. נמדד: הפרדת-רמה של
+                // המחלקה הזו מפריטה רכה בלתי-אפשרית בטווח ±12dB; מחזוריות חסינת-Gain.
+                float yin_gate = yin_gate_threshold_.load(std::memory_order_relaxed);
+                if (auto_triggered && yin_gate > 0.0f) {
+                    if (current_yin < 0.0f) current_yin = compute_yin_from_preroll();
+                    if (current_yin < yin_gate) {
+                        auto_triggered = false;
+                        current_onset_streak_ = 0;   // א-מחזורי — איפוס מלא, פריטה אמיתית תבנה רצף חדש
+                    }
+                }
+
                 bool manual_triggered = (mode == 1) && request_record_start_.exchange(false, std::memory_order_relaxed);
 
                 if (auto_triggered || manual_triggered) {
@@ -836,9 +907,12 @@ void LooperEngine::process_audio_asynchronously() {
                     // באג קריטי שתוקן: התקף אמיתי שלא הצית מיד את שלב א' (למשל פריטה
                     // רכה עם קליק חלש) נלמד כ"רעש", הסף ברח כלפי מעלה מהר מהאות עצמו,
                     // וההתקף הפך בלתי-ניתן-לזיהוי לצמיתות. הקפאת הלמידה בכל אנרגיה מעל
-                    // חצי רצפת התהודה מונעת את הרעלת רצפת הרעש.
-                    float activity_floor = raw_sustain_floor_.load(std::memory_order_relaxed) * 0.5f;
-                    bool looks_like_background = (raw_volume < activity_floor);
+                    // חצי סף התהודה האפקטיבי (יחסי-לרעש, כמו הסף עצמו) מונעת את ההרעלה.
+                    float raw_mean_bg = raw_noise_tracker_.get_mean();
+                    float effective_sustain = std::max({raw_noise_tracker_.get_silence_threshold(),
+                                                        raw_mean_bg * sustain_rel_mult_.load(std::memory_order_relaxed),
+                                                        raw_sustain_floor_.load(std::memory_order_relaxed)});
+                    bool looks_like_background = (raw_volume < effective_sustain * 0.5f);
                     if (current_onset_streak_ == 0 && looks_like_background) {
                         noise_tracker_.observe_background_noise(trigger_volume);
                         raw_noise_tracker_.observe_background_noise(raw_volume);
@@ -876,8 +950,9 @@ void LooperEngine::process_audio_asynchronously() {
                     // מול שבריר מהשיא של ההקלטה עצמה — חסין לרווחי-נגינה, לאקורדים
                     // מוחזקים, לדקרשנדו, ולעוצמת כניסה משתנה בין מכשירים.
                     session_peak_raw = std::max(session_peak_raw, raw_volume);
-                    float sil_floor = std::max(raw_noise_tracker_.get_silence_threshold(),
-                                               silence_abs_floor_.load(std::memory_order_relaxed));
+                    float sil_floor = std::max({raw_noise_tracker_.get_silence_threshold(),
+                                                raw_noise_tracker_.get_mean() * silence_rel_mult_.load(std::memory_order_relaxed),
+                                                silence_abs_floor_.load(std::memory_order_relaxed)});
                     float activity_floor = std::max(sil_floor,
                         session_peak_raw * activity_ratio_.load(std::memory_order_relaxed));
                     size_t silence_target = static_cast<size_t>(
@@ -931,6 +1006,22 @@ void LooperEngine::process_audio_asynchronously() {
                 // המוזיקלי עצמו, ולכן אין צורך בתיקונים הוריסטיים נוספים.
                 float actual_playing_samples = static_cast<float>(recorded_audio.size() - trailing_non_musical_samples);
                 int assembly_mode = detection_mode_.load(std::memory_order_relaxed);
+
+                // וטו תוכן-מזערי (מצבי Auto בלבד): טרנזיינט סביבתי שהצית הקלטה
+                // (חבטה/התנעת קומפרסור) עובר רמה+משך+מחזוריות אך מתפוגג בלי להשאיר
+                // תוכן מוזיקלי. נמדד: FP = 0.1-0.2s תוכן; הפריטה הבודדת הרפה ביותר
+                // בקורפוס = 0.94s (שוליים ×4.7). משך לא סוקל עם Gain ⇒ חסין-רגישות.
+                // TAP (mode 1) ריבוני — המשתמש קבע את הגבולות בעצמו.
+                if (assembly_mode != 1 &&
+                    actual_playing_samples <
+                        min_musical_seconds_.load(std::memory_order_relaxed) * config_.sample_rate) {
+                    std::cout << "[DSP] Take vetoed: only "
+                              << (actual_playing_samples / config_.sample_rate)
+                              << "s of musical content — non-musical transient, back to IDLE." << std::endl;
+                    recorded_audio.clear();
+                    current_state_.store(LooperState::IDLE, std::memory_order_release);
+                    break;
+                }
                 size_t ideal_length;
 
                 if (assembly_mode == 2) {
@@ -1117,10 +1208,13 @@ void LooperEngine::process_audio_asynchronously() {
             t.rise_ratio = trigger_volume / std::max(prev_trigger_volume, 1e-9f);
             float min_onset = min_onset_rms_.load(std::memory_order_relaxed);
             t.onset_level_threshold = std::max(noise_tracker_.get_onset_threshold(), min_onset);
-            t.sustain_threshold = std::max(raw_noise_tracker_.get_silence_threshold(),
-                                           raw_sustain_floor_.load(std::memory_order_relaxed));
-            t.silence_threshold = std::max(raw_noise_tracker_.get_silence_threshold(),
-                                           silence_abs_floor_.load(std::memory_order_relaxed));
+            float t_raw_mean = raw_noise_tracker_.get_mean();
+            t.sustain_threshold = std::max({raw_noise_tracker_.get_silence_threshold(),
+                                            t_raw_mean * sustain_rel_mult_.load(std::memory_order_relaxed),
+                                            raw_sustain_floor_.load(std::memory_order_relaxed)});
+            t.silence_threshold = std::max({raw_noise_tracker_.get_silence_threshold(),
+                                            t_raw_mean * silence_rel_mult_.load(std::memory_order_relaxed),
+                                            silence_abs_floor_.load(std::memory_order_relaxed)});
             t.peak_envelope = peak_envelope;
             t.onset_streak = current_onset_streak_;
             t.noise_mean_trigger = noise_tracker_.get_mean();
@@ -1129,6 +1223,7 @@ void LooperEngine::process_audio_asynchronously() {
             t.noise_std_raw = raw_noise_tracker_.get_std_dev();
             t.spectral_flux = current_flux;
             t.flux_threshold = current_flux_threshold;
+            t.yin_confidence = current_yin;
             t.published_loop_samples = last_published_loop_samples;
             last_published_loop_samples = 0;   // מדווח פעם אחת, בצ'אנק הפרסום
             sink(t, telemetry_user_.load(std::memory_order_relaxed));
@@ -1175,7 +1270,8 @@ bool LooperEngine::export_to_wav(const char* filepath) {
     // חי ולא-הרסני — צורבים כאן אם פעיל, כדי שה-Export יישמע כמו ההשמעה. מחממים
     // את הריברב למצב יציב (מריצים את הלופ שוב ושוב) כדי שהזנב יעטוף את התפר
     // וייצא לופ רציף, ואז מקליטים סיבוב אחד של רטוב+יבש.
-    if (reverb_enabled_.load(std::memory_order_relaxed)) {
+    float export_wet = reverb_wet_.load(std::memory_order_relaxed);
+    if (export_wet > 0.001f) {
         FreeverbMono rv;
         rv.init(config_.sample_rate);
         rv.set_params(REVERB_ROOM, REVERB_DAMP);
@@ -1186,7 +1282,7 @@ bool LooperEngine::export_to_wav(const char* filepath) {
         std::vector<float> wet_loop(loop_n);
         for (size_t i = 0; i < loop_n; ++i) {
             float wet = rv.process(snapshot[i]);
-            wet_loop[i] = std::clamp(snapshot[i] + wet * REVERB_WET, -1.0f, 1.0f);
+            wet_loop[i] = std::clamp(snapshot[i] + wet * export_wet, -1.0f, 1.0f);
         }
         snapshot = std::move(wet_loop);
     }

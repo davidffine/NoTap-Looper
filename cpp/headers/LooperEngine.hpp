@@ -116,6 +116,7 @@ struct ChunkTelemetry {
     float spectral_flux;          // [חדש] Spectral Flux זורם (novelty פר-צ'אנק)
     float flux_threshold;         // [חדש] הסף האדפטיבי של ה-Flux (חציון + k·MAD)
     size_t published_loop_samples; // [חדש] אורך לופ שפורסם בצ'אנק זה (0 אם לא פורסם)
+    float yin_confidence;         // [חדש] מובהקות מחזוריות YIN בחלון ההחלטה (-1 = לא חושב)
 };
 using TelemetrySink = void(*)(const ChunkTelemetry& telemetry, void* user);
 
@@ -198,23 +199,41 @@ private:
     std::atomic<int> detection_mode_{0};
 
     // פרמטרי כוונון: נכתבים מ-JNI, נקראים על ה-Worker — אטומיים.
-    // הערכים כוילו אמפירית מול הקורפוס (2026-07-05): ראה [[notap-dsp-roadmap]].
-    std::atomic<float> min_onset_rms_{0.002f};   // רצפת ההתקף במרחב המסונן (שלב א')
-    // רצפת התהודה במרחב הגולמי (שלב ב') — *מנותקת* מ-min_onset.
-    // פריטה רכה וטרנזיינט סביבתי חופפים ברמת ה-RMS הגולמית, ולכן המבחין האמיתי
-    // הוא *משך* התהודה: מיתר מנוגן שומר אנרגיה לאורך עשרות חלונות, נקישה/טרנזיינט
-    // דועך תוך 1-2 חלונות. רצפה נמוכה (0.025) חיונית כדי לתפוס מיתר E פתוח דק
-    // ברמה חלשה (Oboe Unprocessed מחליש את הכניסה פי ~2-4 מול הקלטת ייחוס);
-    // persistence גבוה (12) מפצה ודוחה את הטרנזיינטים הסביבתיים לפי משך בלבד.
-    std::atomic<float> raw_sustain_floor_{0.025f};
+    // כוונון 2026-07-12 (גרסה חסינת-Gain): כל הרצפות המוחלטות הפכו ל-Bootstrap
+    // מזערי בלבד (הגנה מאבק דיגיטלי בחדר מת); ההפרדה האמיתית עברה למכפלות
+    // יחסיות-לרעש (חסינות לרגישות מיקרופון) ולשער המחזוריות של YIN (חסין-Gain
+    // מתמטית — CMND הוא יחס מנורמל). נמדד: הפרדת-רמה של פריטה רכה מול טרנזיינט
+    // סביבתי מתמשך *בלתי אפשרית* בטווח ±12dB (סאסטיין פריטה 0.046-0.065 חופף
+    // לאירוע רעש ב-Gain×4: 0.05-0.18).
+    std::atomic<float> min_onset_rms_{0.0005f};  // Bootstrap במרחב המסונן (שלב א')
+    // רצפת התהודה במרחב הגולמי (שלב ב'): max(רעש+2σ, mean×מכפלה, Bootstrap).
+    // המבחין העיקרי נשאר *משך* התהודה (persistence 12) + מחזוריות YIN;
+    // הרצפה רק מונעת רצפים על אדוות רעש.
+    std::atomic<float> raw_sustain_floor_{0.0025f};      // Bootstrap בלבד
+    std::atomic<float> sustain_rel_mult_{8.0f};          // מכפלת mean רעש גולמי (≈רצפה 0.008 בחדר הייחוס)
     std::atomic<float> onset_rise_ratio_{1.5f};
     // 12 חלונות (~128ms) של תהודה רצופה. ה-Preroll מכסה את זמן ההחלטה.
     std::atomic<int> onset_persistence_target_{12};
 
+    // שער המחזוריות (YIN/CMND) בנקודת ההחלטה. **נמדד ונפסל כמבחין** (2026-07-12):
+    // קומפרסור-AC = מנוע מסתובב + הרמוניות רשת ⇒ מחזורי *חזק* (0.966), חבטת-חדר
+    // מעוררת תהודה דועכת ⇒ 0.92, בעוד סטראם קשה (6 מיתרים לא-הרמוניים + התקף)
+    // ⇒ 0.699. ההפרדה הפוכה — אין סף שהורג AC בלי להרוג סטראם. נשאר כטלמטריה
+    // בלבד (0 = כבוי). אל תפעילו בלי מבחין משלים.
+    std::atomic<float> yin_gate_threshold_{0.0f};
+
+    // וטו תוכן-מזערי ב-PROCESSING (מצבי Auto בלבד): ההרג האמיתי של מחלקת
+    // ה-FP הרחב-סרט. טרנזיינט סביבתי (חבטה/התנעת קומפרסור) עובר את מבחני
+    // הרמה/משך/מחזוריות אך אינו משאיר תוכן: נמדד 0.1-0.2s מול 0.94s לפריטה
+    // הבודדת הרפה ביותר (שוליים ×4.7). משך אינו סוקל עם Gain ⇒ חסין-רגישות.
+    std::atomic<float> min_musical_seconds_{0.6f};
+
     // --- זיהוי שקט (offset) ---
     // סף השקט *מעוגן לרצפת הרעש* ולא לפיק האות: עיגון-לפיק (peak*0.04) גורם
     // ל"רדיפת מעטפת" — על צליל מתמשך ודועך לאט הסף נדבק לאות ואינו נחצה לעולם.
-    std::atomic<float> silence_abs_floor_{0.012f};  // רצפת שקט מוחלטת (~-38dB)
+    // המבנה: max(רעש+2σ, mean×מכפלה, Bootstrap) — יחסי-לרעש, חסין-Gain.
+    std::atomic<float> silence_abs_floor_{0.003f};   // Bootstrap שקט (חדר מת בלבד)
+    std::atomic<float> silence_rel_mult_{12.0f};     // מכפלת mean רעש (≈רצפה 0.012 בחדר הייחוס)
     // סגירת לופ = *מוקדם מבין שני מסלולים* (כויל מול תיוגי ה-end בקורפוס):
     //  (א) שקט מוחלט למשך silence_hold — מהיר, לעצירות mute/סטקטו שמגיעות לשקט אמיתי.
     //  (ב) היעדר *פעילות* למשך activity_hold — לזנב הד/ריברב שנשאר מעל סף השקט.
@@ -247,8 +266,9 @@ private:
     // היו מזהמים גם את ההקלטה וגם את זיהוי השקט. מצב הקליק נוגע רק ב-Thread של
     // ה-Output (process_output_callback), הפרמטרים אטומיים.
     std::atomic<bool> metronome_user_enabled_{true};
-    // ריברב על ה-Output (לא-הרסני): הלופ המוקלט נשאר יבש; הרטוב מתווסף בנגינה בלבד
-    std::atomic<bool> reverb_enabled_{false};
+    // ריברב על ה-Output (לא-הרסני): הלופ המוקלט נשאר יבש; הרטוב מתווסף בנגינה בלבד.
+    // reverb_wet_ = כמות הרטוב 0..1 (0 = יבש/כבוי), נשלט בכפתור.
+    std::atomic<float> reverb_wet_{0.0f};
     FreeverbMono reverb_;
     double metro_free_counter_{0.0};   // מונה חופשי (IDLE); בנגינה נעול למיקום הלופ
     long   metro_last_beat_{-1};
@@ -284,6 +304,10 @@ public:
     void set_onset_persistence(int chunks) { onset_persistence_target_.store(chunks, std::memory_order_relaxed); }
     void set_min_onset_rms(float val) { min_onset_rms_.store(val, std::memory_order_relaxed); }
     void set_raw_sustain_floor(float val) { raw_sustain_floor_.store(val, std::memory_order_relaxed); }
+    void set_sustain_rel_mult(float m) { sustain_rel_mult_.store(m, std::memory_order_relaxed); }
+    void set_silence_rel_mult(float m) { silence_rel_mult_.store(m, std::memory_order_relaxed); }
+    void set_yin_gate_threshold(float t) { yin_gate_threshold_.store(t, std::memory_order_relaxed); }
+    void set_min_musical_seconds(float s) { min_musical_seconds_.store(s, std::memory_order_relaxed); }
     void set_onset_rise_ratio(float ratio) { onset_rise_ratio_.store(ratio, std::memory_order_relaxed); }
     void set_silence_abs_floor(float val) { silence_abs_floor_.store(val, std::memory_order_relaxed); }
     void set_silence_hold_seconds(float sec) { silence_hold_seconds_.store(sec, std::memory_order_relaxed); }
@@ -325,8 +349,8 @@ public:
         metronome_user_enabled_.store(on, std::memory_order_relaxed);
     }
 
-    void set_reverb_enabled(bool on) {
-        reverb_enabled_.store(on, std::memory_order_relaxed);
+    void set_reverb_wet(float wet) {
+        reverb_wet_.store(std::clamp(wet, 0.0f, 1.0f), std::memory_order_relaxed);
     }
 
     // אפקטים חיים על הלופ (0=none 1=reverse 2=octave-up 3=octave-down). מוחל
