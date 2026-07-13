@@ -10,6 +10,10 @@ OboeLooperEngine::~OboeLooperEngine() {
 }
 
 bool OboeLooperEngine::start() {
+    // Idempotent: a second start() (e.g. a redundant onStart) must not open a
+    // duplicate pair of streams. Already running → nothing to do.
+    if (recording_stream_ || playback_stream_) return true;
+
     // ----------------------------------------------------
     // 1. פתיחת זרם המיקרופון (INPUT) - אקוסטיקה טהורה
     // ----------------------------------------------------
@@ -19,7 +23,11 @@ bool OboeLooperEngine::start() {
     in_builder.setChannelCount(oboe::ChannelCount::Mono);
     // חשוב: Unprocessed מבטל את מסנני הרעש של אנדרואיד שלא יהרסו את צליל הגיטרה
     in_builder.setInputPreset(oboe::InputPreset::Unprocessed);
-    in_builder.setSharingMode(oboe::SharingMode::Exclusive);
+    // Shared (לא Exclusive): זרם MMAP בלעדי תופס פורט חומרה ייעודי; סגירתו —
+    // בעיקר במוות אלים (Swipe-kill) — מאלצת את AudioFlinger לפרק את המסלול ולנתב
+    // מחדש, מה שגורם ל-A2DP של המוזיקה לקפוץ לרמקול הפנימי ובחזרה. Shared עובר
+    // דרך המיקסר; אין פורט בלעדי לתפוס/לשחרר, ולכן אין "פאניקת ניתוב".
+    in_builder.setSharingMode(oboe::SharingMode::Shared);
     in_builder.setPerformanceMode(oboe::PerformanceMode::LowLatency);
     in_builder.setCallback(this);
 
@@ -36,8 +44,12 @@ bool OboeLooperEngine::start() {
     out_builder.setDirection(oboe::Direction::Output);
     out_builder.setFormat(oboe::AudioFormat::Float);
     out_builder.setChannelCount(oboe::ChannelCount::Mono);
-    out_builder.setSharingMode(oboe::SharingMode::Exclusive);
+    out_builder.setSharingMode(oboe::SharingMode::Shared);   // ראה הערת ה-INPUT — מונע תפיסת פורט בלעדי
     out_builder.setPerformanceMode(oboe::PerformanceMode::LowLatency);
+    // כוונת הניתוב מפורשת: זהו אודיו מדיה/מוזיקה — משתלב נקי עם נגני מדיה אחרים
+    // (Spotify) במקום להיחשב מסלול תקשורת/התראה שמאלץ ניתוב מיוחד.
+    out_builder.setUsage(oboe::Usage::Media);
+    out_builder.setContentType(oboe::ContentType::Music);
     out_builder.setCallback(this);
     // קריטי: הרמקול חייב לעבוד בדיוק באותו קצב דגימה כמו המיקרופון
     out_builder.setSampleRate(recording_stream_->getSampleRate());
@@ -70,16 +82,21 @@ bool OboeLooperEngine::start() {
     return true;
 }
 
+// פירוק חינני *סינכרוני*: requestStop() ו-close() של Oboe חוסמים עד להשלמה,
+// ולכן כשהפונקציה חוזרת ה-HAL כבר שוחרר נקי. נקרא מ-onStop() — "חלון הזהב"
+// שמובטח לפני Swipe-kill. סדר: עוצרים את *שני* הזרמים (שום פורט לא פעיל), ורק
+// אז סוגרים — הפלט קודם (מפסיק לרנדר), ואז הקלט (משחרר את מסלול הלכידה אחרון).
 void OboeLooperEngine::stop() {
-    if (recording_stream_) {
-        recording_stream_->requestStop();
-        recording_stream_->close();
-        recording_stream_.reset();
-    }
+    if (playback_stream_)  playback_stream_->requestStop();
+    if (recording_stream_) recording_stream_->requestStop();
+
     if (playback_stream_) {
-        playback_stream_->requestStop();
         playback_stream_->close();
         playback_stream_.reset();
+    }
+    if (recording_stream_) {
+        recording_stream_->close();
+        recording_stream_.reset();
     }
 }
 

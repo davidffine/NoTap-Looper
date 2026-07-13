@@ -46,6 +46,7 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *e
     env->SetFloatArrayRegion(outData, 0, 3, telemetry);
 }
 
+// פירוק חומרה מלא — נקרא רק ביציאה אמיתית (onCleared/onDestroy).
 JNIEXPORT void JNICALL
 Java_com_notap_looper_AudioEngine_stopEngine(JNIEnv *env, jobject thiz) {
     if (g_oboe_bridge) {
@@ -57,6 +58,21 @@ Java_com_notap_looper_AudioEngine_stopEngine(JNIEnv *env, jobject thiz) {
         delete g_engine;
         g_engine = nullptr;
     }
+}
+
+// "חלון הזהב" של onStop(): משחרר את זרמי ה-Oboe (וה-HAL) *סינכרונית* אך משאיר
+// את ה-LooperEngine ואת חוצץ הלופ חיים בזיכרון. אם המשתמש רק מ-backgrounds
+// וחוזר — resumeAudio יחבר זרמים חדשים לאותו מנוע/לופ. אם הוא עושה Swipe-kill,
+// ה-HAL כבר שוחרר נקי לפני מוות התהליך, והזיכרון נאסף על-ידי מות התהליך.
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_pauseAudio(JNIEnv *env, jobject thiz) {
+    if (g_oboe_bridge) g_oboe_bridge->stop();   // requestStop()+close() חוסמים — חוזר רק אחרי שחרור
+}
+
+// חיבור-מחדש של הזרמים אל המנוע הקיים (start() אידמפוטנטי — לא יפתח כפילות).
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_resumeAudio(JNIEnv *env, jobject thiz) {
+    if (g_oboe_bridge) g_oboe_bridge->start();
 }
 
 JNIEXPORT void JNICALL
