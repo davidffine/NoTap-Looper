@@ -20,11 +20,15 @@ enum class LooperState {
 
 std::string state_to_string(LooperState state);
 
+// FTZ/DAZ הם מצב רגיסטר FP *פר-Thread*. חייב להיקרא על כל Thread שמריץ DSP:
+// ה-Worker קורא לזה בעצמו; ה-Bridge של Oboe חייב לקרוא לזה על Thread הקולבק
+// (הריברב — רשת משוב דועכת — הוא מחולל הדנורמלים הקלאסי, ורץ על Thread הפלט).
+void enable_denormal_flush_to_zero();
+
 struct EngineConfig {
     int sample_rate = 44100;
     int chunk_size = 512;
     float preroll_seconds = 0.15f;
-    float silence_duration = 0.8f;
 };
 
 // מיקס אוברדאב עם ברך רכה: לינארי לחלוטין עד KNEE, דחיסה אסימפטוטית ל-±1.0 מעליו.
@@ -220,6 +224,16 @@ private:
     // הבודדת הרפה ביותר (שוליים ×4.7). משך אינו סוקל עם Gain ⇒ חסין-רגישות.
     std::atomic<float> min_musical_seconds_{0.6f};
 
+    // נטישת-דרון בזמן RECORDING (מצבי Auto בלבד): רעש רחב-סרט *שאינו נגמר*
+    // (שואב-אבק/מקלחת/גשם) עובר את הטריגר ואז לא סוגר לעולם — לא שקט ולא
+    // היעדר-פעילות — והיה מגיע לרצפת ה-300s ומפרסם לופ-זבל. המבחין: נגינה
+    // אמיתית מכילה *ארטיקולציות* (התקפים חדשים); בקורפוס הפער המקסימלי בין
+    // ארטיקולציות בהקלטה לגיטימית = 5.57s (כולל זנב-עד-עצירה). 10s = שוליים
+    // ×1.8. בנטישה: ההקלטה נזרקת וחוזרים ל-CALIBRATING עם איפוס מלא של
+    // הסטטיסטיקה — הרעש החדש נלמד כרצפה (ריפוי-עצמי); בלי האיפוס, הסטטיסטיקה
+    // הישנה שורדת ונכנסים ללולאת הקלטות-רפאים של 10s לנצח.
+    std::atomic<float> drone_abort_seconds_{10.0f};
+
     // --- זיהוי שקט (offset) ---
     // סף השקט *מעוגן לרצפת הרעש* ולא לפיק האות: עיגון-לפיק (peak*0.04) גורם
     // ל"רדיפת מעטפת" — על צליל מתמשך ודועך לאט הסף נדבק לאות ואינו נחצה לעולם.
@@ -300,6 +314,7 @@ public:
     void set_silence_rel_mult(float m) { silence_rel_mult_.store(m, std::memory_order_relaxed); }
     void set_yin_gate_threshold(float t) { yin_gate_threshold_.store(t, std::memory_order_relaxed); }
     void set_min_musical_seconds(float s) { min_musical_seconds_.store(s, std::memory_order_relaxed); }
+    void set_drone_abort_seconds(float s) { drone_abort_seconds_.store(s, std::memory_order_relaxed); }
     void set_onset_rise_ratio(float ratio) { onset_rise_ratio_.store(ratio, std::memory_order_relaxed); }
     void set_silence_abs_floor(float val) { silence_abs_floor_.store(val, std::memory_order_relaxed); }
     void set_silence_hold_seconds(float sec) { silence_hold_seconds_.store(sec, std::memory_order_relaxed); }

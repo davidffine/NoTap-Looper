@@ -87,6 +87,12 @@ void OboeLooperEngine::stop() {
 oboe::DataCallbackResult OboeLooperEngine::onAudioReady(oboe::AudioStream *audioStream,
                                                         void *audioData,
                                                         int32_t numFrames) {
+    // FTZ הוא מצב רגיסטר פר-Thread; Threads של Oboe נוצרים על-ידי המערכת ואין
+    // Hook לתחילתם — מציתים פעם אחת פר-Thread מכאן. בלעדיו זנב הריברב הדועך
+    // (רשת משוב ×0.84) מייצר דנורמלים על Thread הפלט — סכנת נחירת CPU בזמן-אמת.
+    static thread_local bool ftz_armed = false;
+    if (!ftz_armed) { enable_denormal_flush_to_zero(); ftz_armed = true; }
+
     float* floatData = static_cast<float*>(audioData);
 
     // ניתוב דטרמיניסטי לפי כיוון הזרם

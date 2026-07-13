@@ -21,9 +21,9 @@ namespace {
 }
 
 // FTZ/DAZ הם מצב של רגיסטר ה-FP *של ה-Thread הנוכחי*.
-// חייבים להיקרא מתוך ה-Worker עצמו — קריאה מה-Constructor מגינה על ה-Thread הלא נכון.
-// באנדרואיד האמיתי (ARM) הענף של x86 לא מתקמפל כלל, ולכן חובה ענף FPCR/FPSCR ייעודי.
-static void enable_denormal_flush_to_zero() {
+// חייבים להיקרא מתוך ה-Thread המריץ עצמו — קריאה מה-Constructor מגינה על ה-Thread
+// הלא נכון. באנדרואיד האמיתי (ARM) ענף ה-x86 לא מתקמפל כלל — חובה ענף FPCR/FPSCR.
+void enable_denormal_flush_to_zero() {
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
     _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
     _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
@@ -602,6 +602,7 @@ void LooperEngine::process_audio_asynchronously() {
 
     std::vector<float> recorded_audio;
     recorded_audio.reserve(config_.sample_rate * 60);
+    size_t samples_since_articulation = 0;   // מונה נטישת-הדרון (Auto בלבד)
 
     // סקראץ' אוברדאב פרטי ל-Worker: כל המיקסים קורים כאן,
     // והתוצאה מתפרסמת לחוצץ הכפול פעם בכל השלמת סיבוב לופ.
@@ -645,10 +646,18 @@ void LooperEngine::process_audio_asynchronously() {
         return yin_periodicity(yin_win.data(), static_cast<int>(W), tau_min, tau_max);
     };
 
+    // חוסם DC חד-קוטבי (~10Hz) על כל דגימת כניסה. InputPreset::Unprocessed עלול
+    // לספק הטיית DC, והיא מרעילה את כל הסטטיסטיקה היחסית-לרעש: raw-RMS ≥ DC תמיד,
+    // ולכן ממוצע הרעש לומד את *ההטיה* וכל הרצפות (×8, ×12) נבנות עליה.
+    // נמדד: DC של 0.5% FS שובר עצירות (13/15 + 2 סרק); 2% FS קטסטרופלי —
+    // recall 7/15, עצירות 1/15. ב-10Hz הגיטרה נקייה (E=82Hz: ‎-0.06dB) והתכנסות
+    // צעד-ההטיה ~16ms — בתוך תקופת הכיול. גם ההקלטות/ייצוא יוצאים נקיי-DC.
+    float dc_x1 = 0.0f, dc_y1 = 0.0f, dc_R = 1.0f;
     auto recompute_time_constants = [&]() {
         float chunk_seconds = static_cast<float>(config_.chunk_size) / static_cast<float>(config_.sample_rate);
         env_release_coef = std::exp(-chunk_seconds / ENV_RELEASE_SECONDS);
         max_record_samples = static_cast<size_t>(MAX_RECORD_SECONDS * config_.sample_rate);
+        dc_R = 1.0f - (2.0f * 3.14159265358979323846f * 10.0f) / static_cast<float>(config_.sample_rate);
     };
     recompute_time_constants();
 
@@ -741,7 +750,10 @@ void LooperEngine::process_audio_asynchronously() {
         // של 512) היה מפסיק להיות תקף במכשיר. local_chunk נשמר בין איטרציות
         // עד שמתמלא במלואו; שום דגימה לא אובדת.
         while (local_chunk.size() < static_cast<size_t>(config_.chunk_size) && input_queue_.pop(sample)) {
-            local_chunk.push_back(sample);
+            float blocked = sample - dc_x1 + dc_R * dc_y1;   // חוסם ה-DC
+            dc_x1 = sample;
+            dc_y1 = blocked;
+            local_chunk.push_back(blocked);
         }
 
         if (local_chunk.size() < static_cast<size_t>(config_.chunk_size)) { std::this_thread::yield(); continue; }
@@ -861,6 +873,7 @@ void LooperEngine::process_audio_asynchronously() {
                     silence_samples_count = 0;
                     inactivity_count = 0;
                     trailing_non_musical_samples = 0;
+                    samples_since_articulation = 0;   // ההתקף הפותח הוא הארטיקולציה הראשונה
                     current_state_.store(LooperState::RECORDING, std::memory_order_release);
                 } else {
                     // 3. עדכון סביבה דינמי — אך *רק* כשהצ'אנק באמת נראה כמו רקע.
@@ -935,6 +948,32 @@ void LooperEngine::process_audio_asynchronously() {
                         inactivity_count >= inactivity_target) {
                         trailing_non_musical_samples = std::max(silence_samples_count, inactivity_count);
                         current_state_.store(LooperState::PROCESSING, std::memory_order_release);
+                    }
+
+                    // נטישת-דרון: רעש מתמשך שלא נגמר (שואב/מקלחת/גשם) לא סוגר באף
+                    // מסלול — אין שקט ואין היעדר-פעילות — אבל גם אין בו *ארטיקולציות*
+                    // (התקפים חדשים במרחב המסונן). בקורפוס: פער-ארטיקולציות מרבי
+                    // בהקלטה לגיטימית 5.57s ⇒ 10s = שוליים ×1.8. הנגן שקט 10s = ממילא
+                    // אין מוזיקה לשמור. ההקלטה נזרקת, והכיול מאופס במלואו כדי שהרעש
+                    // החדש יילמד כרצפה (בלי האיפוס — לולאת הקלטות-רפאים אינסופית).
+                    bool articulated = trigger_volume >
+                                           std::max(noise_tracker_.get_onset_threshold(),
+                                                    min_onset_rms_.load(std::memory_order_relaxed)) &&
+                                       trigger_volume > prev_trigger_volume *
+                                           onset_rise_ratio_.load(std::memory_order_relaxed);
+                    if (articulated) samples_since_articulation = 0;
+                    else samples_since_articulation += local_chunk.size();
+                    if (samples_since_articulation >
+                        static_cast<size_t>(drone_abort_seconds_.load(std::memory_order_relaxed) *
+                                            config_.sample_rate)) {
+                        std::cout << "[DSP] Drone abort: no articulation for "
+                                  << drone_abort_seconds_.load(std::memory_order_relaxed)
+                                  << "s — discarding take, relearning the room." << std::endl;
+                        recorded_audio.clear();
+                        noise_tracker_.reconfigure(config_.sample_rate, config_.chunk_size, 1.0f);
+                        raw_noise_tracker_.reconfigure(config_.sample_rate, config_.chunk_size, 1.0f);
+                        current_state_.store(LooperState::CALIBRATING, std::memory_order_release);
+                        break;
                     }
                 }
 
