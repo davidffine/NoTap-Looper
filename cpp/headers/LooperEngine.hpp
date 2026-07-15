@@ -31,17 +31,20 @@ struct EngineConfig {
     float preroll_seconds = 0.15f;
 };
 
-// מיקס אוברדאב עם ברך רכה: לינארי לחלוטין עד KNEE, דחיסה אסימפטוטית ל-±1.0 מעליו.
-// הנוסחה הקודמת x/(1+|x|) דחסה *בכל* עוצמה — כל מעבר אוברדאב הנחית את הלופ הקיים
-// (0.3→0.23) גם עם כניסה שקטה, דגרדציה מצטברת בכל סיבוב.
-inline float mix_and_soft_clip(float existing_sample, float new_sample) {
-    float sum = existing_sample + new_sample;
+// ברך-רכה על סכום *כלשהו*: לינארי לחלוטין עד KNEE, דחיסה אסימפטוטית ל-±1.0 מעליו.
+// מקור-אמת יחיד לדחיסת המיקס — משמש גם את מיקס-האוברדאב הדו-אופרנדי וגם את
+// חיבור ה-N שכבות (רב-מסלול). הנוסחה הקודמת x/(1+|x|) דחסה *בכל* עוצמה — כל
+// מעבר אוברדאב הנחית את הלופ הקיים (0.3→0.23) גם עם כניסה שקטה.
+inline float soft_clip_knee(float sum) {
     const float KNEE = 0.9f;
     float mag = std::abs(sum);
     if (mag <= KNEE) return sum;
     float over = mag - KNEE;
     float compressed = KNEE + (1.0f - KNEE) * (over / (over + (1.0f - KNEE)));
     return sum > 0.0f ? compressed : -compressed;
+}
+inline float mix_and_soft_clip(float existing_sample, float new_sample) {
+    return soft_clip_knee(existing_sample + new_sample);
 }
 
 // ריברב Freeverb מונו (Schroeder/Moorer): 8 מסנני-מסרק מרוסנים במקביל אל תוך
@@ -180,6 +183,29 @@ private:
     std::atomic<bool> request_clear_{false};
     std::atomic<int>  request_effect_{0};   // 0=none 1=reverse 2=octave-up 3=octave-down
 
+    // --- רב-מסלול (Multi-track) ---
+    // כל אוברדאב נשמר כשכבה נפרדת (Worker-owned), והמיקס מחושב-מחדש אל חוצץ
+    // ה-RCU בכל שינוי שכבות. פקודות מגיעות מ-JNI דרך אטומיים; ה-Worker הוא
+    // המפרסם היחיד. מסלול 0 = הבסיס המוגן (נמחק רק ב-clear הכללי). request_delete_layer_
+    // נושא את *אינדקס* השכבה למחיקה (>=1), או -1 כשאין בקשה.
+    std::atomic<int> request_delete_layer_{-1};
+    std::atomic<int> layer_count_{0};       // מראה לקריאת ה-UI (0 = אין לופ)
+
+    // --- אפקטים פר-שכבה (פייז 3, Pro) ---
+    // ערוצי פקודה index+value (Last-Write-Wins; אובדן ערכי-ביניים בגרירת סליידר
+    // הוא תקין). הכותב = JNI; ה-Worker צורך ומרנדר-מחדש את השכבה+המיקס. -1 = אין.
+    static constexpr int kMaxLayers = 16;   // בסיס + 15 אוברדאבים
+    std::atomic<int>   req_layer_fx_idx_{-1};
+    std::atomic<int>   req_layer_fx_kind_{0};      // 0=none 1=reverse 2=oct-up 3=oct-down
+    std::atomic<int>   req_layer_gain_idx_{-1};
+    std::atomic<float> req_layer_gain_val_{1.0f};
+    std::atomic<int>   req_layer_reverb_idx_{-1};
+    std::atomic<float> req_layer_reverb_val_{0.0f};
+    // מראה מצב פר-שכבה לקריאת ה-UI (ה-Worker כותב בכל שינוי שכבות; JNI קורא).
+    std::atomic<int>   layer_fx_[kMaxLayers]{};
+    std::atomic<float> layer_gain_[kMaxLayers]{};
+    std::atomic<float> layer_reverb_[kMaxLayers]{};
+
     // בקשות קונפיגורציית חומרה: נרשמות כאן, מוחלות אך ורק על-ידי ה-Worker
     std::atomic<int> pending_sample_rate_{-1};
     std::atomic<float> pending_preroll_seconds_{-1.0f};
@@ -302,6 +328,37 @@ public:
     void execute_overdub_command();
     void execute_loop_command();
     void execute_clear_command();
+
+    // רב-מסלול: מחיקת שכבת-אוברדאב לפי אינדקס (>=1; 0=בסיס מוגן, מתעלמים).
+    // רק רושם בקשה; ה-Worker מבצע ומחשב-מחדש את המיקס (מודל RCU).
+    void delete_layer(int index) { request_delete_layer_.store(index, std::memory_order_relaxed); }
+    // מס' השכבות הפעילות (בסיס + אוברדאבים). 0 = אין לופ. נקרא מ-JNI/UI.
+    int get_layer_count() const { return layer_count_.load(std::memory_order_relaxed); }
+
+    // --- אפקטים פר-שכבה (פייז 3): כתיבת פקודה + קריאת מצב-מראה ---
+    // value נכתב לפני index (release) כדי שה-Worker יקרא ערך עקבי. חוקי לכל
+    // אינדקס תקף (כולל הבסיס — "מוגן" נוגע רק למחיקה, לא לאפקטים).
+    void set_layer_fx(int index, int kind) {
+        req_layer_fx_kind_.store(kind, std::memory_order_relaxed);
+        req_layer_fx_idx_.store(index, std::memory_order_release);
+    }
+    void set_layer_gain(int index, float gain) {
+        req_layer_gain_val_.store(gain, std::memory_order_relaxed);
+        req_layer_gain_idx_.store(index, std::memory_order_release);
+    }
+    void set_layer_reverb(int index, float wet) {
+        req_layer_reverb_val_.store(wet, std::memory_order_relaxed);
+        req_layer_reverb_idx_.store(index, std::memory_order_release);
+    }
+    int   get_layer_fx(int index) const {
+        return (index >= 0 && index < kMaxLayers) ? layer_fx_[index].load(std::memory_order_relaxed) : 0;
+    }
+    float get_layer_gain(int index) const {
+        return (index >= 0 && index < kMaxLayers) ? layer_gain_[index].load(std::memory_order_relaxed) : 1.0f;
+    }
+    float get_layer_reverb(int index) const {
+        return (index >= 0 && index < kMaxLayers) ? layer_reverb_[index].load(std::memory_order_relaxed) : 0.0f;
+    }
 
     void execute_record_start_command();
     void execute_record_stop_command();

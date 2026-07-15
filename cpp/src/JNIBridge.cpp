@@ -96,6 +96,49 @@ Java_com_notap_looper_AudioEngine_clearLoop(JNIEnv *env, jobject thiz) {
     }
 }
 
+// רב-מסלול: מחיקת שכבת-אוברדאב לפי אינדקס (>=1; 0=בסיס מוגן).
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_deleteLayer(JNIEnv *env, jobject thiz, jint index) {
+    if (g_engine) {
+        g_engine->delete_layer(static_cast<int>(index));
+    }
+}
+
+// מס' השכבות הפעילות (בסיס + אוברדאבים); 0 = אין לופ.
+JNIEXPORT jint JNICALL
+Java_com_notap_looper_AudioEngine_getLayerCount(JNIEnv *env, jobject thiz) {
+    if (g_engine) {
+        return g_engine->get_layer_count();
+    }
+    return 0;
+}
+
+// --- אפקטים פר-שכבה (פייז 3) ---
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setLayerFx(JNIEnv *env, jobject thiz, jint index, jint kind) {
+    if (g_engine) g_engine->set_layer_fx(static_cast<int>(index), static_cast<int>(kind));
+}
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setLayerGain(JNIEnv *env, jobject thiz, jint index, jfloat gain) {
+    if (g_engine) g_engine->set_layer_gain(static_cast<int>(index), gain);
+}
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setLayerReverb(JNIEnv *env, jobject thiz, jint index, jfloat wet) {
+    if (g_engine) g_engine->set_layer_reverb(static_cast<int>(index), wet);
+}
+JNIEXPORT jint JNICALL
+Java_com_notap_looper_AudioEngine_getLayerFx(JNIEnv *env, jobject thiz, jint index) {
+    return g_engine ? g_engine->get_layer_fx(static_cast<int>(index)) : 0;
+}
+JNIEXPORT jfloat JNICALL
+Java_com_notap_looper_AudioEngine_getLayerGain(JNIEnv *env, jobject thiz, jint index) {
+    return g_engine ? g_engine->get_layer_gain(static_cast<int>(index)) : 1.0f;
+}
+JNIEXPORT jfloat JNICALL
+Java_com_notap_looper_AudioEngine_getLayerReverb(JNIEnv *env, jobject thiz, jint index) {
+    return g_engine ? g_engine->get_layer_reverb(static_cast<int>(index)) : 0.0f;
+}
+
 // [חדש] העברת הפקודה לתוך הפיזיקה
 JNIEXPORT void JNICALL
 Java_com_notap_looper_AudioEngine_setDetectionMode(JNIEnv *env, jobject thiz, jint mode) {
