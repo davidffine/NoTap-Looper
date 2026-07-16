@@ -30,20 +30,30 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_executeRecordStop(JNIEn
     }
 }
 
-// בתוך JNIBridge.cpp
+// חציית-JNI *יחידה* לכל פריים של לולאת ה-60fps: כל מה שה-UI צריך פר-טיק נארז
+// למערך float אחד, ללא שום הקצאת אובייקט. (בעבר: 6 חציות/פריים, אחת מהן
+// NewStringUTF — הקצאת String פר-פריים = ‎~5M הקצאות ליום שימוש, זבל GC בלולאת
+// הרנדר.) חוזה האינדקסים (מראה מדויקת ב-AudioEngine.kt/LooperViewModel):
+//   [0]=rms · [1]=noise_std · [2]=transient(0/1) · [3]=state ordinal (חוזה
+//   LooperState: 0=CAL 1=IDLE 2=REC 3=PROC 4=LOOP 5=OVERDUB) · [4]=bpm ·
+//   [5]=loop_beats · [6]=loop_pos(0..1) · [7]=layer_count
 JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *env, jobject thiz, jfloatArray outData) {
-    if (!g_engine) return;
+    if (!g_engine || outData == nullptr) return;
+    if (env->GetArrayLength(outData) < 8) return;
 
-    jfloat telemetry[3];
+    jfloat telemetry[8];
     telemetry[0] = g_engine->current_rms_.load(std::memory_order_relaxed);
     telemetry[1] = g_engine->current_noise_std_dev_.load(std::memory_order_relaxed);
-
     // קריאה ואיפוס אטומי של דגל הטרנזיינט
-    bool hit = g_engine->transient_hit_flag_.exchange(false, std::memory_order_relaxed);
-    telemetry[2] = hit ? 1.0f : 0.0f;
+    telemetry[2] = g_engine->transient_hit_flag_.exchange(false, std::memory_order_relaxed) ? 1.0f : 0.0f;
+    telemetry[3] = static_cast<jfloat>(static_cast<int>(g_engine->get_current_state()));
+    telemetry[4] = g_engine->get_estimated_bpm();
+    telemetry[5] = g_engine->get_loop_beats();
+    telemetry[6] = g_engine->get_loop_position();
+    telemetry[7] = static_cast<jfloat>(g_engine->get_layer_count());
 
     // כתיבה חזרה למערך של Kotlin ללא הקצאות זיכרון חדשות
-    env->SetFloatArrayRegion(outData, 0, 3, telemetry);
+    env->SetFloatArrayRegion(outData, 0, 8, telemetry);
 }
 
 // תצפית: סה"כ דגימות-כניסה שנשמטו (תור מלא). ~0 תמיד; חשיפה לקצה-מקרה פתולוגי.
@@ -111,15 +121,6 @@ Java_com_notap_looper_AudioEngine_deleteLayer(JNIEnv *env, jobject thiz, jint in
     }
 }
 
-// מס' השכבות הפעילות (בסיס + אוברדאבים); 0 = אין לופ.
-JNIEXPORT jint JNICALL
-Java_com_notap_looper_AudioEngine_getLayerCount(JNIEnv *env, jobject thiz) {
-    if (g_engine) {
-        return g_engine->get_layer_count();
-    }
-    return 0;
-}
-
 // --- אפקטים פר-שכבה (פייז 3) ---
 JNIEXPORT void JNICALL
 Java_com_notap_looper_AudioEngine_setLayerFx(JNIEnv *env, jobject thiz, jint index, jint kind) {
@@ -154,38 +155,9 @@ Java_com_notap_looper_AudioEngine_setDetectionMode(JNIEnv *env, jobject thiz, ji
     }
 }
 
-JNIEXPORT jfloat JNICALL
-Java_com_notap_looper_AudioEngine_getEstimatedBPM(JNIEnv *env, jobject thiz) {
-    if (g_engine) {
-        return g_engine->get_estimated_bpm();
-    }
-    return 0.0f;
-}
-
-JNIEXPORT jfloat JNICALL
-Java_com_notap_looper_AudioEngine_getLoopBeats(JNIEnv *env, jobject thiz) {
-    if (g_engine) {
-        return g_engine->get_loop_beats();
-    }
-    return 0.0f;
-}
-
-JNIEXPORT jfloat JNICALL
-Java_com_notap_looper_AudioEngine_getLoopPosition(JNIEnv *env, jobject thiz) {
-    if (g_engine) {
-        return g_engine->get_loop_position();
-    }
-    return 0.0f;
-}
-
-JNIEXPORT jstring JNICALL
-Java_com_notap_looper_AudioEngine_getCurrentState(JNIEnv *env, jobject thiz) {
-    if (g_engine) {
-        std::string state_str = state_to_string(g_engine->get_current_state());
-        return env->NewStringUTF(state_str.c_str());
-    }
-    return env->NewStringUTF("UNKNOWN");
-}
+// (getCurrentState/getEstimatedBPM/getLoopBeats/getLoopPosition/getLayerCount
+// נמחקו: כולם אוחדו לתוך pollTelemetry — חציית-JNI אחת פר-פריים, אפס הקצאות.
+// getCurrentState היה הגרוע מכולם: NewStringUTF פר-פריים ב-60fps.)
 
 JNIEXPORT jboolean JNICALL Java_com_notap_looper_AudioEngine_exportLoopWav(JNIEnv *env, jobject thiz, jstring path) {
     if (!g_engine) return false;
