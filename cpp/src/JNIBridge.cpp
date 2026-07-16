@@ -46,6 +46,13 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *e
     env->SetFloatArrayRegion(outData, 0, 3, telemetry);
 }
 
+// תצפית: סה"כ דגימות-כניסה שנשמטו (תור מלא). ~0 תמיד; חשיפה לקצה-מקרה פתולוגי.
+// uint32 מורחב ל-jlong כדי להימנע מסימן שלילי בתצוגה.
+JNIEXPORT jlong JNICALL
+Java_com_notap_looper_AudioEngine_getInputOverrunCount(JNIEnv *env, jobject thiz) {
+    return g_engine ? static_cast<jlong>(g_engine->get_input_overrun_count()) : 0;
+}
+
 // פירוק חומרה מלא — נקרא רק ביציאה אמיתית (onCleared/onDestroy).
 JNIEXPORT void JNICALL
 Java_com_notap_looper_AudioEngine_stopEngine(JNIEnv *env, jobject thiz) {
@@ -196,6 +203,24 @@ JNIEXPORT jboolean JNICALL Java_com_notap_looper_AudioEngine_importLoopWav(JNIEn
     return result;
 }
 
+// סשן רב-מסלולי (NTSN): שמירה/שחזור של כל השכבות כולל פרמטרי fx/gain/reverb.
+// save חוסם עד השלמת הכתיבה (ראה save_session); load = מסירה בסגנון Import.
+JNIEXPORT jboolean JNICALL Java_com_notap_looper_AudioEngine_saveSession(JNIEnv *env, jobject thiz, jstring path) {
+    if (!g_engine) return false;
+    const char *nativeString = env->GetStringUTFChars(path, 0);
+    bool result = g_engine->save_session(nativeString);
+    env->ReleaseStringUTFChars(path, nativeString);
+    return result;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_notap_looper_AudioEngine_loadSession(JNIEnv *env, jobject thiz, jstring path) {
+    if (!g_engine) return false;
+    const char *nativeString = env->GetStringUTFChars(path, 0);
+    bool result = g_engine->load_session(nativeString);
+    env->ReleaseStringUTFChars(path, nativeString);
+    return result;
+}
+
 JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setTargetBPM(JNIEnv *env, jobject thiz, jfloat bpm) {
     if (g_engine) {
         g_engine->set_target_bpm(bpm);
@@ -208,17 +233,8 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setMetronomeEnabled(JNI
     }
 }
 
-JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_applyLoopEffect(JNIEnv *env, jobject thiz, jint effect) {
-    if (g_engine) {
-        g_engine->request_effect(effect);
-    }
-}
-
-JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_setReverbWet(JNIEnv *env, jobject thiz, jfloat wet) {
-    if (g_engine) {
-        g_engine->set_reverb_wet(wet);
-    }
-}
+// (applyLoopEffect / setReverbWet נמחקו: הנתיב הגלובלי מת — כל האפקטים והריברב
+// הם פר-שכבה דרך setLayerFx/setLayerGain/setLayerReverb.)
 
 JNIEXPORT jint JNICALL Java_com_notap_looper_AudioEngine_getLoopWaveform(JNIEnv *env, jobject thiz, jfloatArray out) {
     if (!g_engine || out == nullptr) return 0;

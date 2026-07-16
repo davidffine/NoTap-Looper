@@ -79,6 +79,30 @@ bool OboeLooperEngine::start() {
     recording_stream_->requestStart();
     playback_stream_->requestStart();
 
+    // --- אומדן לייטנסי הלוך-ושוב לפיצוי אוברדאב ---
+    // הדגימה שנקלטת "עכשיו" נוגנה כנגד מה שהמשתמש שמע לפני (פלט+קלט); המנוע
+    // מעגן את כתיבת האוברדאב אחורה בהתאם. מקור מועדף: timestamps של המערכת
+    // (calculateLatencyMillis) — מיד אחרי start הם לרוב עוד לא זורמים, ואז נסוגים
+    // לאומדן דטרמיניסטי: סכום חוצצי-התוכנה של שני הזרמים + מרווח HAL/המרה שמרני
+    // (10ms — תת-אומדן מכוון: פיצוי-חסר משאיר איחור קטן; פיצוי-יתר היה מקדים את
+    // השכבה, שגיאה בולטת יותר פסיכו-אקוסטית).
+    {
+        double total_ms;
+        auto in_lat  = recording_stream_->calculateLatencyMillis();
+        auto out_lat = playback_stream_->calculateLatencyMillis();
+        if (in_lat && out_lat && in_lat.value() > 0.0 && out_lat.value() > 0.0) {
+            total_ms = in_lat.value() + out_lat.value();
+        } else {
+            int frames = recording_stream_->getBufferSizeInFrames() +
+                         playback_stream_->getBufferSizeInFrames();
+            total_ms = 1000.0 * frames / hardware_sample_rate + 10.0;
+        }
+        int comp_samples = static_cast<int>(total_ms * hardware_sample_rate / 1000.0);
+        dsp_engine_.set_overdub_latency_samples(comp_samples);
+        std::cout << "[Hardware] Overdub latency compensation: " << total_ms
+                  << "ms (" << comp_samples << " samples)" << std::endl;
+    }
+
     return true;
 }
 

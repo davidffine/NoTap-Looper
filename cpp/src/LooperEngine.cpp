@@ -4,8 +4,12 @@
 #include "../includes/kissfft/kiss_fftr.h"
 #include "../headers/miniaudio.h"
 #include <iostream>
+#include <fstream>
 #include <cmath>
+#include <chrono>
+#include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <numeric>
 #include <algorithm>
 
@@ -14,8 +18,8 @@
 #include <pmmintrin.h>
 #endif
 
-// פרמטרי הריברב — מקור אמת יחיד. כמות הרטוב (WET) נשלטת בזמן-אמת ע"י הכפתור
-// (reverb_wet_ במנוע); הטווח והריסון קבועים.
+// פרמטרי הריברב — מקור אמת יחיד עבור צריבת הריברב הפר-שכבתית (bake_reverb_loop).
+// כמות ה-WET פר-שכבה; האופי (חדר/ריסון) קבוע.
 namespace {
     constexpr float REVERB_ROOM = 0.72f;
     constexpr float REVERB_DAMP = 0.45f;
@@ -36,12 +40,49 @@ namespace {
         float reverb = 0.0f;          // כמות ריברב פר-שכבה, נצרבת ל-samples
     };
 
+    // --- קובץ סשן NTSN v1 (שמירת-אוטומט רב-מסלולית, פנימי-למכשיר) ---
+    // header: magic "NTSN" · version u32 · sample_rate u32 · layer_count u32 ·
+    //         loop_length u64 · bpm f32 · beats f32
+    // per-layer: gain f32 · fx i32 · reverb f32 · dry[loop_length] f32
+    // dry נשמר כ-float גולמי (שחזור ביט-מדויק; samples מרונדרים מחדש בטעינה).
+    // Little-endian בלבד — קובץ מקומי-למכשיר (ARM/x86 שניהם LE), לא פורמט חליפין.
+    // כתיבה אטומית-בקירוב: tmp ואז rename, כך שקריסה באמצע לא משחיתה סשן קודם.
+    constexpr char     kSessionMagic[4] = {'N','T','S','N'};
+    constexpr uint32_t kSessionVersion  = 1;
+
+    inline bool write_session_file(const std::string& path, const std::vector<Layer>& layers,
+                                   size_t loop_len, int sr, float bpm, float beats) {
+        if (layers.empty() || loop_len == 0) return false;
+        for (const Layer& L : layers)
+            if (L.dry.size() != loop_len) return false;   // אינוריאנטה לפני כל I/O
+        const std::string tmp = path + ".tmp";
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
+        auto put = [&](const void* p, size_t n) { f.write(static_cast<const char*>(p), n); };
+        uint32_t ver = kSessionVersion, srate = static_cast<uint32_t>(sr),
+                 count = static_cast<uint32_t>(layers.size());
+        uint64_t len64 = static_cast<uint64_t>(loop_len);
+        put(kSessionMagic, 4); put(&ver, 4); put(&srate, 4); put(&count, 4);
+        put(&len64, 8); put(&bpm, 4); put(&beats, 4);
+        for (const Layer& L : layers) {
+            int32_t fx32 = L.fx;
+            put(&L.gain, 4); put(&fx32, 4); put(&L.reverb, 4);
+            put(L.dry.data(), loop_len * sizeof(float));
+        }
+        f.flush();
+        bool ok = static_cast<bool>(f);
+        f.close();
+        if (!ok) { std::remove(tmp.c_str()); return false; }
+        std::remove(path.c_str());   // rename אינו דורס בכל הפלטפורמות — מסירים קודם
+        return std::rename(tmp.c_str(), path.c_str()) == 0;
+    }
+
     // צריבת ריברב שומרת-אורך על סיבוב לופ יחיד (זהה לנתיב הייצוא): מחממים
     // Freeverb עד יציבות כדי שהזנב יעטוף את התפר, ואז לוכדים סיבוב אחד רטוב+יבש.
     inline std::vector<float> bake_reverb_loop(const std::vector<float>& loop, float wet, int sr) {
         FreeverbMono rv;
         rv.init(sr);
-        rv.set_params(0.72f /*REVERB_ROOM*/, 0.45f /*REVERB_DAMP*/);
+        rv.set_params(REVERB_ROOM, REVERB_DAMP);
         const size_t n = loop.size();
         if (n == 0) return loop;
         size_t warm_target = std::max(static_cast<size_t>(3 * sr), n);
@@ -172,14 +213,36 @@ LooperEngine::LooperEngine(EngineConfig config) :
         noise_tracker_(config.sample_rate, config.chunk_size, 1.0f),
         raw_noise_tracker_(config.sample_rate, config.chunk_size, 1.0f)
 {
-    reverb_.init(config_.sample_rate);
-    reverb_.set_params(REVERB_ROOM, REVERB_DAMP);   // "produced" default
+    // הקצאת חוצצי ה-FFT של עקומת ה-Novelty פעם אחת (NFFT קבוע, בלתי-תלוי בקצב
+    // הדגימה) — מבטל kiss_fftr_alloc ואת הקצאות הווקטורים מנתיב ה-PROCESSING.
+    // חייב לקרות *לפני* הרצת ה-Worker (המשתמש היחיד) — אין Race.
+    novelty_fft_cfg_ = kiss_fftr_alloc(kNoveltyNFFT, 0, nullptr, nullptr);
+    novelty_time_in_.assign(kNoveltyNFFT, 0.0f);
+    novelty_freq_out_.resize(kNoveltyNFFT / 2 + 1);
+    novelty_prev_mag_.assign(kNoveltyNFFT / 2 + 1, 0.0f);
+    novelty_hann_.resize(kNoveltyNFFT);
+    {
+        const float PI_F = 3.14159265358979323846f;
+        for (int j = 0; j < kNoveltyNFFT; ++j)
+            novelty_hann_[j] = 0.5f * (1.0f - std::cos(2.0f * PI_F * j / (kNoveltyNFFT - 1)));
+    }
+
+    // טבלת גל ה-sin של קליק המטרונום — מחושבת פעם אחת (מחליפה std::sin פר-דגימה).
+    click_sine_.resize(kClickTableSize);
+    {
+        const double TWO_PI = 6.283185307179586;
+        for (int i = 0; i < kClickTableSize; ++i)
+            click_sine_[i] = static_cast<float>(std::sin(TWO_PI * i / kClickTableSize));
+    }
+
     worker_thread_ = std::thread(&LooperEngine::process_audio_asynchronously, this);
 }
 
 LooperEngine::~LooperEngine() {
     is_running_.store(false, std::memory_order_relaxed);
     if (worker_thread_.joinable()) worker_thread_.join();
+    // רק אחרי שה-Worker (המשתמש היחיד) נעצר — שחרור חוצץ ה-FFT.
+    if (novelty_fft_cfg_) { kiss_fftr_free(novelty_fft_cfg_); novelty_fft_cfg_ = nullptr; }
 }
 
 void LooperEngine::execute_overdub_command() { request_overdub_.store(true, std::memory_order_relaxed); }
@@ -221,7 +284,14 @@ void LooperEngine::update_hardware_config(int sample_rate, float latency_seconds
 }
 
 void LooperEngine::on_audio_callback(const float* input_data, size_t num_frames) {
-    for (size_t i = 0; i < num_frames; ++i) input_queue_.push(input_data[i]);
+    // Wait-Free: דחיפה ללא נעילה; שמיטה שקטה כשהתור מלא (המדיניות היחידה שאינה
+    // חוסמת את Thread ה-RT). סופרים את הנשמטות למונה אטומי — הנתיב היחיד שמעדכן
+    // אותו הוא זה שכמעט אף פעם לא נלקח (חוצץ 5 שניות), ולכן העלות היא אפס בפועל.
+    size_t dropped = 0;
+    for (size_t i = 0; i < num_frames; ++i)
+        if (!input_queue_.push(input_data[i])) ++dropped;
+    if (dropped)
+        input_overrun_count_.fetch_add(static_cast<uint32_t>(dropped), std::memory_order_relaxed);
 }
 
 void LooperEngine::process_output_callback(float* output_data, size_t num_frames) {
@@ -254,16 +324,8 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
         }
     }
 
-    // ריברב על אות הלופ (רטוב מתווסף ליבש). מוחל לפני המטרונום כדי שהקליקים
-    // יישארו יבשים וברורים. לא-הרסני: החוצץ המוקלט לא משתנה.
-    float wet_amount = reverb_wet_.load(std::memory_order_relaxed);
-    if (playing && wet_amount > 0.001f) {
-        for (size_t i = 0; i < num_frames; ++i) {
-            float wet = reverb_.process(output_data[i]);
-            output_data[i] = std::clamp(output_data[i] + wet * wet_amount, -1.0f, 1.0f);
-        }
-    }
-
+    // (אין DSP נוסף על נתיב הפלט: הריברב פר-שכבה נצרב מראש לתוך המיקס על-ידי
+    // ה-Worker. הקולבק קורא חוצץ מוכן ומוסיף מטרונום בלבד — מינימום עבודה ב-RT.)
     render_metronome(output_data, num_frames, state, playing, loop_pos, loop_size);
 }
 
@@ -277,7 +339,6 @@ void LooperEngine::render_metronome(float* out, size_t num_frames, LooperState s
 
     float bpm = target_bpm_.load(std::memory_order_relaxed);
     if (bpm < 20.0f || bpm > 400.0f) return;
-    const double TWO_PI = 6.283185307179586;
     double beat_period = (60.0 / bpm) * static_cast<double>(config_.sample_rate);
     if (beat_period < 1.0) return;
     const float click_decay = std::exp(-1.0f / (0.018f * config_.sample_rate));
@@ -299,9 +360,17 @@ void LooperEngine::render_metronome(float* out, size_t num_frames, LooperState s
             click_phase_ = 0.0;
         }
         if (click_env_ > 0.001f) {
-            float s = static_cast<float>(std::sin(click_phase_)) * click_env_;
+            // גל sin מטבלה עם אינטרפולציה לינארית — מחליף std::sin פר-דגימה.
+            // click_phase_ ב-[0,1) מייצג מחזור; מדד הטבלה = phase · גודל.
+            float t = static_cast<float>(click_phase_) * kClickTableSize;
+            int i0 = static_cast<int>(t);
+            float frac = t - static_cast<float>(i0);
+            i0 &= (kClickTableSize - 1);
+            int i1 = (i0 + 1) & (kClickTableSize - 1);
+            float s = (click_sine_[i0] + frac * (click_sine_[i1] - click_sine_[i0])) * click_env_;
             out[i] = std::clamp(out[i] + s, -1.0f, 1.0f);
-            click_phase_ += TWO_PI * click_freq_ / config_.sample_rate;
+            click_phase_ += click_freq_ / static_cast<double>(config_.sample_rate);   // מחזורים/דגימה
+            if (click_phase_ >= 1.0) click_phase_ -= 1.0;                             // עטיפה ([0,1))
             click_env_ *= click_decay;
         }
     }
@@ -337,65 +406,54 @@ size_t LooperEngine::find_true_onset(const std::vector<float>& audio_data, size_
 // אומדן הטמפו בלבד. (ה-Flux הזורם פר-צ'אנק הוסר: נמדד ונפסל כמבחין התקף.)
 std::vector<float> LooperEngine::extract_novelty_curve(const std::vector<float>& audio_data, int& out_chunk_size) {
     // גודל חלון ה-FFT. קובע את הרזולוציה בתדר מול הזמן.
-    const int NFFT = 1024;
+    const int NFFT = kNoveltyNFFT;
     const int HOP_SIZE = NFFT / 2; // חפיפה של 50%
 
     // קביעת קצב הדגימה הווירטואלי של העקומה
     out_chunk_size = HOP_SIZE;
 
     std::vector<float> novelty;
-    if (audio_data.size() < NFFT) return novelty;
+    if (audio_data.size() < static_cast<size_t>(NFFT)) return novelty;
 
     novelty.reserve(audio_data.size() / HOP_SIZE);
 
-    // אתחול KissFFT עבור ערכים ממשיים
-    kiss_fftr_cfg fft_cfg = kiss_fftr_alloc(NFFT, 0, nullptr, nullptr);
-    std::vector<kiss_fft_scalar> time_in(NFFT, 0.0f);
-    std::vector<kiss_fft_cpx> freq_out(NFFT / 2 + 1);
-
-    std::vector<float> prev_magnitudes(NFFT / 2 + 1, 0.0f);
-
-    // חישוב חלון Hann פעם אחת מראש במקום cos() לכל דגימה בכל חלון
-    const float PI_F = 3.14159265358979323846f;
-    std::vector<float> hann_window(NFFT);
-    for (int j = 0; j < NFFT; ++j) {
-        hann_window[j] = 0.5f * (1.0f - std::cos(2.0f * PI_F * j / (NFFT - 1)));
-    }
+    // חוצצי ה-FFT (config, חלון Hann, כניסה, יציאה) מוקצים בבנאי ונעשה בהם
+    // שימוש-חוזר — כאן רק מאפסים את מגניטודת-החלון-הקודם, שמצטברת פר-קריאה.
+    // ה-Worker הוא הקורא היחיד, ולכן אין צורך בסנכרון.
+    std::fill(novelty_prev_mag_.begin(), novelty_prev_mag_.end(), 0.0f);
 
     // מעבר על האודיו בחלונות קופצים
     for (size_t i = 0; i + NFFT <= audio_data.size(); i += HOP_SIZE) {
         // 1. החלת חלון (Hann Window) למניעת זליגת תדרים בקצוות
         for (int j = 0; j < NFFT; ++j) {
-            time_in[j] = audio_data[i + j] * hann_window[j];
+            novelty_time_in_[j] = audio_data[i + j] * novelty_hann_[j];
         }
 
         // 2. ביצוע התמרת פורייה
-        kiss_fftr(fft_cfg, time_in.data(), freq_out.data());
+        kiss_fftr(novelty_fft_cfg_, novelty_time_in_.data(), novelty_freq_out_.data());
 
         float current_flux = 0.0f;
 
         // 3. חישוב ה-Spectral Flux (המשוואה המדוברת)
         for (int k = 0; k <= NFFT / 2; ++k) {
             // חישוב מגניטודה של המספר המרוכב
-            float real = freq_out[k].r;
-            float imag = freq_out[k].i;
+            float real = novelty_freq_out_[k].r;
+            float imag = novelty_freq_out_[k].i;
             float magnitude = std::sqrt(real * real + imag * imag);
 
             // חישוב ההפרש בין החלון הנוכחי לקודם
-            float diff = magnitude - prev_magnitudes[k];
+            float diff = magnitude - novelty_prev_mag_[k];
 
             // Half-wave rectification (הוספת אנרגיה חדשה בלבד)
             if (diff > 0.0f) {
                 current_flux += diff;
             }
 
-            prev_magnitudes[k] = magnitude;
+            novelty_prev_mag_[k] = magnitude;
         }
 
         novelty.push_back(current_flux);
     }
-
-    kiss_fftr_free(fft_cfg);
 
     return novelty;
 }
@@ -574,28 +632,9 @@ std::vector<float> LooperEngine::apply_seam_fold(std::vector<float>& audio, size
     return result;
 }
 
-std::vector<float> LooperEngine::apply_loop_effect(const std::vector<float>& src, int fx) {
-    std::vector<float> dst;
-    if (src.empty()) return dst;
-    // אין שום טיפול-תפר אחרי הטרנספורמציות — בכוונה:
-    //  Reverse משמר רציפות תפר (ההיפוך של תפר רציף הוא תפר רציף) ולכן נשאר
-    //  באורך *מדויק* (הקיפול הישן קיצר אותו ב-256 ושבר את הבטחת הסנכרון);
-    //  האוקטבות מסוננות *מעגלית* (ראה OctaveResample.hpp) — הלופ הוא מעגל,
-    //  והסינון המעגלי משמר את רציפות התפר של המקור מתמטית.
-    switch (fx) {
-        case 1: // reverse — אורך זהה, נשאר בסנכרון
-            dst.assign(src.rbegin(), src.rend());
-            break;
-        case 2: // octave up — חצי-סרט מעגלי + דצימציה ×2 (חצי אורך)
-            dst = notap_dsp::octave_up(src);
-            break;
-        case 3: // octave down — אינטרפולטור חצי-סרט מעגלי (כפול אורך)
-            dst = notap_dsp::octave_down(src);
-            break;
-        default: return dst;
-    }
-    return dst;
-}
+// (apply_loop_effect — האפקט הגלובלי-לכל-הלופ — נמחק: מאז שלוח-האפקטים הראשי
+// עבר לעריכת השכבה הנוכחית, לא נותר לו שום קורא ב-UI. האוקטבה משנת-האורך
+// ההיסטורית קיימת ב-git; האוקטבה החיה היא octave_pitch שומרת-האורך פר-שכבה.)
 
 int LooperEngine::get_loop_waveform(float* out, int max_bins) {
     if (!out || max_bins <= 0) return 0;
@@ -651,6 +690,15 @@ void LooperEngine::process_audio_asynchronously() {
     std::vector<float> mix_temp_;         // סקראץ' לרינדור לפני פרסום (מזעור זמן-נעילה)
     size_t overdub_idx = 0;
     bool overdub_publish_pending = false;
+
+    // --- פרסום חלק (נטול-קליק) בשני שלבים לעריכות שכבה שומרות-אורך ---
+    // מחיקה/אפקט/עוצמה מחליפים את המיקס בבת-אחת; בלי טיפול, בנקודת הקריאה נוצרת
+    // מדרגת-תוכן (הפרש בין המיקס הישן לחדש) — קליק רחב-סרט כשמוחקים שכבה חזקה
+    // באמצע צליל. שלב 1 מפרסם חוצץ שמשמר את התוכן הישן סביב ראש-הקריאה ונמזג
+    // לחדש קדימה ממנו; שלב 2 (אחרי שהקורא חלף על אזור-הטלאי) מפרסם את המיקס
+    // הטהור — אחרת הטלאי (תוכן ישן) היה מתנגן שוב בכל סיבוב.
+    std::vector<float> pure_mix_pending;  // מטען שלב-2 (המיקס הטהור); ריק = אין ממתין
+    int pure_publish_countdown = 0;       // צ'אנקים עד שלב 2
 
     // סכום גולמי (ללא ברך) של כל השכבות המקובעות → committed_mix_ (בסיס מוניטור אוברדאב).
     auto render_committed_raw = [&]() {
@@ -795,6 +843,50 @@ void LooperEngine::process_audio_asynchronously() {
         return true;
     };
 
+    // ביטול שלב-2 ממתין — בכל אירוע שהופך אותו לישן (Clear/Import/בסיס חדש/אוברדאב).
+    auto cancel_pending_pure = [&]() {
+        pure_mix_pending.clear();
+        pure_publish_countdown = 0;
+    };
+
+    // פרסום נטול-קליק של mix_temp_ (שלב 1) עבור עריכות שומרות-אורך במצב LOOPING.
+    //   [rd, rd+MARGIN):        תוכן ישן — הקורא יימצא כאן ברגע ההחלפה (מדרגה=0)
+    //   [rd+MARGIN, +FADE):     מיזוג קוסינוס ישן→חדש (אפס-נגזרת בקצוות)
+    //   שאר החוצץ:              המיקס החדש
+    // שלב 2 מתוזמן ב-pure_publish_countdown. לופ קצר מכפל-הטלאי → פרסום רגיל
+    // (הטלאי היה עוטף את עצמו). הקורא לעולם לא נחסם — כל המיזוג נבנה כאן, ב-Worker.
+    auto publish_mix_smoothed = [&]() -> bool {
+        const size_t len = loop_length_;
+        const size_t MARGIN = 4 * static_cast<size_t>(config_.chunk_size);  // מרווח התקדמות-קורא + דחיית-Slot
+        const size_t FADE = 1024;                                           // ‎~21ms @48k
+        int active = active_playback_idx_.load(std::memory_order_relaxed);
+        // ה-Worker הוא הממוטט היחיד של playback_buffers_ — קריאה מכאן בטוחה ללא נעילה
+        const std::vector<float>& cur = playback_buffers_[active];
+        if (cur.size() != len || mix_temp_.size() != len || len < 2 * (MARGIN + FADE)) {
+            return publish_mix_temp(/*reset_read=*/false);   // בלי החלקה — קצר/לא-תואם
+        }
+        pure_mix_pending = mix_temp_;   // מטען שלב-2: המיקס הטהור, לפני המיזוג-במקום
+        const size_t rd = playback_read_idx_.load(std::memory_order_relaxed) % len;
+        for (size_t k = 0; k < MARGIN; ++k) {
+            size_t j = (rd + k) % len;
+            mix_temp_[j] = cur[j];
+        }
+        const float PI_F = 3.14159265358979323846f;
+        for (size_t k = 0; k < FADE; ++k) {
+            size_t j = (rd + MARGIN + k) % len;
+            float w = 0.5f * (1.0f - std::cos(PI_F * static_cast<float>(k) / FADE));  // 0→1
+            mix_temp_[j] = cur[j] * (1.0f - w) + mix_temp_[j] * w;
+        }
+        if (publish_mix_temp(/*reset_read=*/false)) {
+            // שלב 2 אחרי שהקורא ודאי חלף על הטלאי (+שוליים)
+            pure_publish_countdown =
+                static_cast<int>((MARGIN + FADE) / config_.chunk_size) + 6;
+            return true;
+        }
+        cancel_pending_pure();   // הפרסום נדחה — הקורא זז; נחשב מחדש בניסיון הבא
+        return false;
+    };
+
     while (is_running_.load(std::memory_order_relaxed)) {
 
         // --- החלת בקשות קונפיגורציית חומרה (נרשמות מ-Threads אחרים, מוחלות רק כאן) ---
@@ -837,6 +929,7 @@ void LooperEngine::process_audio_asynchronously() {
                 }
                 loop_length_ = layers_[0].samples.size();
                 sync_layer_mirror();
+                cancel_pending_pure();   // מיקס ממתין מהלופ הקודם — ישן
                 {
                     std::lock_guard<std::mutex> lock(buffer_mutex_);
                     playback_buffers_[slot] = layers_[0].samples;
@@ -850,6 +943,85 @@ void LooperEngine::process_audio_asynchronously() {
             // slot == -1: הקורא עוד לא נצפה — ננסה שוב באיטרציה הבאה
         }
 
+        // --- שמירת סשן (בקשה מ-JNI; רק ה-Worker רואה את layers_) ---
+        // רץ בכל מצב: הכתיבה (עשרות ms) חוסמת רק את ה-Worker — הקורא ממשיך לנגן
+        // מהחוצץ המפורסם, ותור הכניסה (5s) סופג את ההשהיה. אוברדאב שבתהליך אינו
+        // נשמר (רק שכבות מקובעות) — סמנטיקה של "מה שנעול נשמר".
+        if (request_save_session_.exchange(false, std::memory_order_relaxed)) {
+            std::string save_path;
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                save_path = pending_save_path_;
+            }
+            bool ok = write_session_file(save_path, layers_, loop_length_, config_.sample_rate,
+                                         estimated_bpm_.load(std::memory_order_relaxed),
+                                         loop_beats_.load(std::memory_order_relaxed));
+            session_save_result_.store(ok ? 1 : -1, std::memory_order_release);
+            if (ok) std::cout << "[I/O] Session saved (" << layers_.size() << " layers)." << std::endl;
+        }
+
+        // --- החלת סשן שנטען (פוענח על JNI, מוחל ומפורסם רק כאן) ---
+        // משחזר את *מבנה השכבות המלא*: dry לכל שכבה + gain/fx/reverb, עם רינדור
+        // מחדש (render_layer צורב fx/reverb מה-dry) — לא מיקס משוטח. קצב-דגימה
+        // שונה מהחומרה הנוכחית נדחה (אין ריסמפול; כמעט-בלתי-אפשרי באותו מכשיר).
+        if (has_pending_session_.load(std::memory_order_acquire)) {
+            int slot = acquire_writable_slot();
+            if (slot >= 0) {
+                std::vector<SessionLayer> sess;
+                int sess_rate; float sess_bpm, sess_beats;
+                {
+                    std::lock_guard<std::mutex> lock(buffer_mutex_);
+                    sess.swap(pending_session_);
+                    sess_rate = pending_session_rate_;
+                    sess_bpm = pending_session_bpm_;
+                    sess_beats = pending_session_beats_;
+                }
+                has_pending_session_.store(false, std::memory_order_release);
+                bool ok = (sess_rate == config_.sample_rate) && !sess.empty();
+                bool started = false;   // האם נגענו ב-layers_ (להבחנת ניקוי מדחייה נקייה)
+                if (ok) {
+                    started = true;
+                    layers_.clear();
+                    loop_length_ = sess[0].dry.size();
+                    for (SessionLayer& sl : sess) {
+                        if (sl.dry.size() != loop_length_) { ok = false; break; }
+                        Layer L;
+                        L.dry = std::move(sl.dry);
+                        L.gain = std::clamp(sl.gain, 0.0f, 2.0f);
+                        L.fx = sl.fx;
+                        L.reverb = std::clamp(sl.reverb, 0.0f, 1.0f);
+                        render_layer(L);   // samples = fx∘reverb(dry) — צריבה טרייה
+                        layers_.push_back(std::move(L));
+                    }
+                }
+                if (ok && !layers_.empty()) {
+                    cancel_pending_pure();
+                    sync_layer_mirror();
+                    render_full_mix_excluding(-1, mix_temp_);
+                    {
+                        std::lock_guard<std::mutex> lock(buffer_mutex_);
+                        playback_buffers_[slot].swap(mix_temp_);
+                    }
+                    playback_read_idx_.store(0, std::memory_order_relaxed);
+                    active_playback_idx_.store(slot, std::memory_order_release);
+                    estimated_bpm_.store(sess_bpm, std::memory_order_relaxed);
+                    loop_beats_.store(sess_beats, std::memory_order_relaxed);
+                    current_state_.store(LooperState::LOOPING, std::memory_order_release);
+                    std::cout << "[I/O] Session restored (" << layers_.size() << " layers)." << std::endl;
+                } else if (started) {
+                    // נכשל *אחרי* שהתחלנו לבנות — layers_ במצב חלקי; מנקים לגמרי.
+                    layers_.clear();
+                    loop_length_ = 0;
+                    sync_layer_mirror();
+                    std::cout << "[I/O] Session rejected mid-build (broken lengths)." << std::endl;
+                } else {
+                    // דחייה נקייה (קצב זר) — שום דבר לא נגוע; המצב הקיים נשאר.
+                    std::cout << "[I/O] Session rejected (sample-rate mismatch)." << std::endl;
+                }
+            }
+            // slot == -1: הקורא עוד לא נצפה — ננסה שוב באיטרציה הבאה
+        }
+
         if (request_clear_.exchange(false, std::memory_order_relaxed)) {
             recorded_audio.clear();
             layers_.clear();
@@ -857,6 +1029,7 @@ void LooperEngine::process_audio_asynchronously() {
             committed_mix_.clear();
             new_layer_.clear();
             overdub_publish_pending = false;
+            cancel_pending_pure();
             sync_layer_mirror();
             current_onset_streak_ = 0;
             silence_samples_count = 0;
@@ -1238,6 +1411,7 @@ void LooperEngine::process_audio_asynchronously() {
                     layers_.clear();
                     layers_.push_back(make_layer(std::move(final_loop)));
                     sync_layer_mirror();
+                    cancel_pending_pure();   // בסיס חדש — כל מיקס ממתין ישן
                     int slot = acquire_writable_slot();
                     if (slot < 0) slot = 1 - active_playback_idx_.load(std::memory_order_relaxed);
                     {
@@ -1254,57 +1428,32 @@ void LooperEngine::process_audio_asynchronously() {
             }
 
             case LooperState::LOOPING: {
-                // --- אפקטים גלובליים (Reverse / Octave) — מוחלים על ה-dry של *כל* שכבה ---
-                // עובד על ה-dry (לא על samples) כדי להתרכב עם אפקטי-השכבה: אחרי הבייק
-                // כל שכבה מרונדרת-מחדש (fx/reverb פר-שכבה מעל ה-dry החדש). זהו הריסמפול
-                // ההיסטורי (apply_loop_effect): reverse שומר-אורך, אוקטבה *משנה אורך/טמפו*
-                // — התנהגות הכפתור הגלובלי נשמרת כפי שהייתה. כל השכבות עוברות טרנספורם
-                // *אחיד* ⇒ loop_length_ מתעדכן וכולן נשארות באורך זהה (אינוריאנטה).
-                // (בניגוד לאוקטבת-*השכבה* שהיא העתקת-גובה שומרת-אורך — שתי סמנטיקות שונות.)
-                int fx = request_effect_.load(std::memory_order_relaxed);
-                if (fx != 0 && !layers_.empty()) {
-                    std::vector<Layer> transformed = layers_;   // עותק — נדרוס רק אחרי פרסום מוצלח
-                    size_t new_len = 0;
-                    bool ok = true;
-                    for (Layer& L : transformed) {
-                        std::vector<float> d = apply_loop_effect(L.dry, fx);   // reverse / octave-resample
-                        if (d.empty()) { ok = false; break; }
-                        if (new_len == 0) new_len = d.size();
-                        else if (d.size() != new_len) { ok = false; break; }   // הגנת-אינוריאנטה
-                        L.dry = std::move(d);
-                    }
-                    if (ok && new_len > 0) {
-                        // loop_length_ הזמני = new_len כדי ש-render_layer (וההגנה שבו)
-                        // ירנדרו את השכבות באורך היעד; משוחזר אם הפרסום נדחה.
-                        size_t saved_len = loop_length_;
-                        loop_length_ = new_len;
-                        for (Layer& L : transformed) render_layer(L);   // fx/reverb פר-שכבה על ה-dry החדש
-                        render_from(transformed, new_len, mix_temp_);
-                        if (publish_mix_temp(/*reset_read=*/true)) {    // אורך אולי השתנה → איפוס קריאה
-                            request_effect_.store(0, std::memory_order_relaxed);
-                            layers_.swap(transformed);
-                            sync_layer_mirror();
-                            if (fx != 1) loop_beats_.store(0.0f, std::memory_order_relaxed);  // אוקטבה → רשת לא תקפה
-                        } else {
-                            loop_length_ = saved_len;   // slot תפוס — שחזר, ננסה שוב בצ'אנק הבא
-                        }
+                // --- שלב 2 של פרסום חלק: ברגע שהקורא חלף על הטלאי — פרסום המיקס הטהור ---
+                // (אחרת אזור-הטלאי, שמכיל תוכן ישן, היה מתנגן שוב בכל סיבוב.)
+                if (!pure_mix_pending.empty()) {
+                    if (pure_mix_pending.size() != loop_length_) {
+                        cancel_pending_pure();               // ישן — האורך השתנה מתחתיו
+                    } else if (pure_publish_countdown > 0) {
+                        --pure_publish_countdown;
                     } else {
-                        request_effect_.store(0, std::memory_order_relaxed);   // בקשה לא-חוקית — נזרקת
+                        mix_temp_ = pure_mix_pending;        // העתקה — נשמר עד הצלחה
+                        if (publish_mix_temp(/*reset_read=*/false)) cancel_pending_pure();
+                        // slot תפוס: ננסה שוב בצ'אנק הבא
                     }
                 }
 
                 // --- מחיקת שכבת-אוברדאב (רב-מסלול, חינמי) ---
                 // אינדקס >=1 בלבד: מסלול 0 הוא הבסיס המוגן. אורך הלופ אינו משתנה
-                // ⇒ הקורא ממשיך מאותו מיקום בלי קפיצה.
+                // ⇒ הקורא ממשיך מאותו מיקום בלי קפיצה; הפרסום החלק מוחק את מדרגת-התוכן.
                 int del = request_delete_layer_.load(std::memory_order_relaxed);
                 if (del >= 1 && del < static_cast<int>(layers_.size())) {
                     render_full_mix_excluding(del, mix_temp_);
-                    if (publish_mix_temp(/*reset_read=*/false)) {
+                    if (publish_mix_smoothed()) {
                         request_delete_layer_.store(-1, std::memory_order_relaxed);
                         layers_.erase(layers_.begin() + del);
                         sync_layer_mirror();
                     }
-                    // slot תפוס: נשאיר את הבקשה, ננסה שוב בצ'אנק הבא
+                    // slot תפוס: נשאיר את הבקשה, ננסה שוב בצ'אנק הבא (mix_temp_ מרונדר מחדש)
                 } else if (del >= 0) {
                     request_delete_layer_.store(-1, std::memory_order_relaxed);  // 0=בסיס / מחוץ-לטווח → התעלם
                 }
@@ -1321,7 +1470,7 @@ void LooperEngine::process_audio_asynchronously() {
                     render_layer(layers_[lfx_idx]);            // dry→samples לפי ה-fx החדש
                     if (layers_[lfx_idx].samples.size() == loop_length_) {
                         render_full_mix_excluding(-1, mix_temp_);
-                        if (publish_mix_temp(/*reset_read=*/false)) {
+                        if (publish_mix_smoothed()) {
                             req_layer_fx_idx_.store(-1, std::memory_order_relaxed);
                             sync_layer_mirror();
                         }
@@ -1342,7 +1491,7 @@ void LooperEngine::process_audio_asynchronously() {
                     render_layer(layers_[lrv_idx]);
                     if (layers_[lrv_idx].samples.size() == loop_length_) {
                         render_full_mix_excluding(-1, mix_temp_);
-                        if (publish_mix_temp(/*reset_read=*/false)) {
+                        if (publish_mix_smoothed()) {
                             req_layer_reverb_idx_.store(-1, std::memory_order_relaxed);
                             sync_layer_mirror();
                         }
@@ -1354,12 +1503,13 @@ void LooperEngine::process_audio_asynchronously() {
                     req_layer_reverb_idx_.store(-1, std::memory_order_relaxed);
                 }
 
-                // gain: חי וזול (מוחל במיקס בלבד — אין רינדור-שכבה).
+                // gain: חי וזול (מוחל במיקס בלבד — אין רינדור-שכבה). מפורסם חלק —
+                // גרירה שולחת מדרגות בדידות; המיזוג הופך אותן לרציפות (אנטי-Zipper).
                 int lg_idx = req_layer_gain_idx_.load(std::memory_order_acquire);
                 if (lg_idx >= 0 && lg_idx < static_cast<int>(layers_.size())) {
                     layers_[lg_idx].gain = std::clamp(req_layer_gain_val_.load(std::memory_order_relaxed), 0.0f, 2.0f);
                     render_full_mix_excluding(-1, mix_temp_);
-                    if (publish_mix_temp(/*reset_read=*/false)) {
+                    if (publish_mix_smoothed()) {
                         req_layer_gain_idx_.store(-1, std::memory_order_relaxed);
                         sync_layer_mirror();
                     }
@@ -1376,7 +1526,20 @@ void LooperEngine::process_audio_asynchronously() {
                         static_cast<int>(layers_.size()) < kMaxLayers) {
                         render_committed_raw();
                         new_layer_.assign(loop_length_, 0.0f);
-                        overdub_idx = playback_read_idx_.load(std::memory_order_relaxed) % loop_length_;
+                        // מיקס-ממתין (שלב 2) מתייתר: מוניטור האוברדאב יפרסם מיקסים
+                        // מצטברים חדשים ממילא, ופרסום ה"טהור" הישן היה דורס אותם.
+                        cancel_pending_pure();
+                        // --- פיצוי לייטנסי הלוך-ושוב ---
+                        // הדגימה שמגיעה מהמיקרופון "עכשיו" נוגנה על-ידי המשתמש כנגד
+                        // מה ששמע לפני (לייטנסי-פלט + לייטנסי-קלט). בלי הפיצוי כל
+                        // אוברדאב נכתב באיחור סיסטמטי של ~15-40ms — "פלאם" שמעי מול
+                        // הבסיס. ההיסט קבוע לכל משך האוברדאב ⇒ עיגון-כניסה מספיק.
+                        // (שיארית זמן-התור של ה-Worker ~0-1 צ'אנק נותרת — ג'יטר קטן
+                        // שאין לו מדידה זולה; הפיצוי מסיר את הרכיב הדטרמיניסטי.)
+                        size_t comp = static_cast<size_t>(
+                            std::max(0, overdub_comp_samples_.load(std::memory_order_relaxed))) % loop_length_;
+                        overdub_idx = (playback_read_idx_.load(std::memory_order_relaxed) % loop_length_
+                                       + loop_length_ - comp) % loop_length_;
                         overdub_publish_pending = false;
                         current_state_.store(LooperState::OVERDUBBING, std::memory_order_release);
                     }
@@ -1449,6 +1612,7 @@ void LooperEngine::process_audio_asynchronously() {
             t.yin_confidence = current_yin;
             t.published_loop_samples = last_published_loop_samples;
             last_published_loop_samples = 0;   // מדווח פעם אחת, בצ'אנק הפרסום
+            t.input_overrun_count = input_overrun_count_.load(std::memory_order_relaxed);
             sink(t, telemetry_user_.load(std::memory_order_relaxed));
         }
 
@@ -1480,26 +1644,10 @@ bool LooperEngine::export_to_wav(const char* filepath) {
         return false;
     }
 
-    // אפקטי Reverse/Octave כבר צרובים בחוצץ (הרסניים). את הריברב — שלב Output
-    // חי ולא-הרסני — צורבים כאן אם פעיל, כדי שה-Export יישמע כמו ההשמעה. מחממים
-    // את הריברב למצב יציב (מריצים את הלופ שוב ושוב) כדי שהזנב יעטוף את התפר
-    // וייצא לופ רציף, ואז מקליטים סיבוב אחד של רטוב+יבש.
-    float export_wet = reverb_wet_.load(std::memory_order_relaxed);
-    if (export_wet > 0.001f) {
-        FreeverbMono rv;
-        rv.init(config_.sample_rate);
-        rv.set_params(REVERB_ROOM, REVERB_DAMP);
-        size_t loop_n = snapshot.size();
-        size_t warm_target = std::max(static_cast<size_t>(3.0f * config_.sample_rate), loop_n);
-        for (size_t warmed = 0; warmed < warm_target; warmed += loop_n)
-            for (size_t i = 0; i < loop_n; ++i) rv.process(snapshot[i]);   // חימום (תוצאה נזרקת)
-        std::vector<float> wet_loop(loop_n);
-        for (size_t i = 0; i < loop_n; ++i) {
-            float wet = rv.process(snapshot[i]);
-            wet_loop[i] = std::clamp(snapshot[i] + wet * export_wet, -1.0f, 1.0f);
-        }
-        snapshot = std::move(wet_loop);
-    }
+    // המיקס המפורסם כבר מכיל *הכל*: אפקטים פר-שכבה, ריברב פר-שכבה (נצרב על-ידי
+    // ה-Worker אל samples) ועוצמות. שום צריבה נוספת כאן — הייצוא זהה להשמעה
+    // בהגדרה. (הבייק-בייצוא הישן של הריברב הגלובלי נמחק יחד עם הנתיב הגלובלי;
+    // אילו נשאר, היה מוסיף ריברב *כפול* על שכבות שכבר נצרבו.)
 
     // ייצוא כ-PCM 16-bit: פורמט האודיו האוניברסלי. WAV IEEE-float (הפורמט הקודם)
     // אינו מזוהה תמיד כאודיו על-ידי סורק המדיה של אנדרואיד → הקובץ "נעלם" מבוררי
@@ -1563,6 +1711,62 @@ bool LooperEngine::import_from_wav(const char* filepath) {
     has_pending_import_.store(true, std::memory_order_release);
 
     std::cout << "[I/O] Successfully decoded loop — handed off to DSP worker." << std::endl;
+    return true;
+}
+
+bool LooperEngine::save_session(const char* filepath) {
+    // רק ה-Worker רואה את layers_ — רושמים בקשה וממתינים (Poll) לתוצאה.
+    // הסנכרוניות הכרחית: onStop → onCleared (פירוק מלא) רצים ברצף, וכתיבה
+    // א-סינכרונית הייתה מתחרה במנוע שנהרס. ה-Worker מגיב תוך איטרציה (~µs-ms
+    // כשאין אודיו, צ'אנק אחד כשיש); ה-Timeout הוא רשת ביטחון בלבד.
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        pending_save_path_ = filepath;
+    }
+    session_save_result_.store(0, std::memory_order_relaxed);
+    request_save_session_.store(true, std::memory_order_release);
+    for (int i = 0; i < 2000; ++i) {                       // עד ~2s
+        int r = session_save_result_.load(std::memory_order_acquire);
+        if (r != 0) return r > 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+bool LooperEngine::load_session(const char* filepath) {
+    // פענוח על Thread ה-JNI (כמו Import), אימות מבני, ומסירה ל-Worker — המפרסם
+    // היחיד. אימות התאמת קצב-הדגימה נעשה אצל ה-Worker (config_ בבעלותו).
+    std::ifstream f(filepath, std::ios::binary);
+    if (!f) return false;
+    char magic[4]; uint32_t ver = 0, srate = 0, count = 0; uint64_t len64 = 0;
+    float bpm = 0.0f, beats = 0.0f;
+    auto get = [&](void* p, size_t n) { f.read(static_cast<char*>(p), n); };
+    get(magic, 4); get(&ver, 4); get(&srate, 4); get(&count, 4);
+    get(&len64, 8); get(&bpm, 4); get(&beats, 4);
+    if (!f || std::memcmp(magic, kSessionMagic, 4) != 0 || ver != kSessionVersion) return false;
+    // גבולות שפיות: עד תקרת השכבות, ואורך עד ~400s בקצב המוצהר (רצפת ההקלטה 300s)
+    if (count < 1 || count > static_cast<uint32_t>(kMaxLayers)) return false;
+    if (srate < 8000 || srate > 192000) return false;
+    if (len64 < 1 || len64 > static_cast<uint64_t>(srate) * 400ULL) return false;
+
+    std::vector<SessionLayer> sess(count);
+    for (uint32_t k = 0; k < count; ++k) {
+        int32_t fx32 = 0;
+        get(&sess[k].gain, 4); get(&fx32, 4); get(&sess[k].reverb, 4);
+        sess[k].fx = (fx32 >= 0 && fx32 <= 3) ? fx32 : 0;
+        sess[k].dry.resize(static_cast<size_t>(len64));
+        get(sess[k].dry.data(), static_cast<size_t>(len64) * sizeof(float));
+        if (!f) return false;   // קובץ קטום/מושחת — נכשל נקי, שום דבר לא נמסר
+    }
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        pending_session_ = std::move(sess);
+        pending_session_rate_ = static_cast<int>(srate);
+        pending_session_bpm_ = bpm;
+        pending_session_beats_ = beats;
+    }
+    has_pending_session_.store(true, std::memory_order_release);
+    std::cout << "[I/O] Session decoded (" << count << " layers) — handed off to DSP worker." << std::endl;
     return true;
 }
 

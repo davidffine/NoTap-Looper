@@ -1,12 +1,14 @@
 #pragma once
 
 #include "LockFreeRingBuffer.hpp"
+#include "../includes/kissfft/kiss_fftr.h"   // FFT scratch pre-allocated in the ctor (novelty curve)
 #include <vector>
 #include <string>
 #include <atomic>
 #include <thread>
 #include <mutex>
 #include <cmath>
+#include <cstdint>
 #include <algorithm>
 
 enum class LooperState {
@@ -95,6 +97,16 @@ struct FreeverbMono {
     }
 };
 
+// שכבת-סשן: יחידת ההעברה של שמירה/שחזור רב-מסלולי (JNI ↔ Worker). מכילה את
+// ה-dry הפריסטיני + פרמטרי השכבה; ה-samples מרונדרים מחדש בעת הטעינה
+// (render_layer) — כך קובץ הסשן קטן פי-שניים ואין דגרדציה כפולה של אפקטים.
+struct SessionLayer {
+    std::vector<float> dry;
+    float gain = 1.0f;
+    int   fx = 0;          // 0=none 1=reverse 2=oct-up 3=oct-down
+    float reverb = 0.0f;
+};
+
 // טלמטריה פר-צ'אנק עבור ה-Harness האופליין (כוונון אמפירי).
 // במכשיר ה-Sink נשאר null והעלות היא בדיקת מצביע אחת לצ'אנק.
 // הערכים נלקחים מתוך ה-Worker עצמו — מדידה של המנוע האמיתי, לא שחזור שלו.
@@ -116,6 +128,7 @@ struct ChunkTelemetry {
     float noise_std_raw;
     size_t published_loop_samples; // [חדש] אורך לופ שפורסם בצ'אנק זה (0 אם לא פורסם)
     float yin_confidence;         // [חדש] מובהקות מחזוריות YIN בחלון ההחלטה (-1 = לא חושב)
+    uint32_t input_overrun_count; // [חדש] סה"כ דגימות-כניסה שנשמטו (תור מלא) — ~0 תמיד
 };
 using TelemetrySink = void(*)(const ChunkTelemetry& telemetry, void* user);
 
@@ -181,7 +194,6 @@ private:
     std::atomic<bool> request_overdub_{false};
     std::atomic<bool> request_looping_{false};
     std::atomic<bool> request_clear_{false};
-    std::atomic<int>  request_effect_{0};   // 0=none 1=reverse 2=octave-up 3=octave-down
 
     // --- רב-מסלול (Multi-track) ---
     // כל אוברדאב נשמר כשכבה נפרדת (Worker-owned), והמיקס מחושב-מחדש אל חוצץ
@@ -213,6 +225,19 @@ private:
     // מסירת Import: מפוענח על Thread ה-JNI, מפורסם על-ידי ה-Worker
     std::vector<float> pending_import_;           // מוגן על-ידי buffer_mutex_
     std::atomic<bool> has_pending_import_{false};
+
+    // --- שמירה/שחזור סשן רב-מסלולי (פורמט NTSN v1) ---
+    // טעינה: מפוענח על JNI (כמו Import), מוחל על-ידי ה-Worker (בעל layers_ היחיד).
+    // שמירה: ה-Worker לבדו רואה את layers_, ולכן הבקשה נרשמת כאן וה-JNI ממתין
+    // (Poll עם Timeout) לתוצאה — onStop חייב סנכרוניות (teardown רץ אחריו).
+    std::vector<SessionLayer> pending_session_;   // מוגן על-ידי buffer_mutex_
+    int   pending_session_rate_ = 0;              // מוגן על-ידי buffer_mutex_
+    float pending_session_bpm_ = 0.0f;            // מוגן על-ידי buffer_mutex_
+    float pending_session_beats_ = 0.0f;          // מוגן על-ידי buffer_mutex_
+    std::atomic<bool> has_pending_session_{false};
+    std::string pending_save_path_;               // מוגן על-ידי buffer_mutex_
+    std::atomic<bool> request_save_session_{false};
+    std::atomic<int>  session_save_result_{0};    // 0=בתהליך · 1=הצלחה · -1=כשל
 
     std::atomic<float> estimated_bpm_{0.0f};
     std::atomic<float> loop_beats_{0.0f};   // מס' הפעימות בלופ הנוכחי (לרשת ה-UI)
@@ -285,12 +310,31 @@ private:
                                           size_t* last_onset_samples = nullptr);
     float quantize_to_musical_phrase(float raw_beats);
     std::vector<float> apply_seam_fold(std::vector<float>& audio, size_t fold_samples = 2048);
-    std::vector<float> apply_loop_effect(const std::vector<float>& src, int fx);
     void process_audio_asynchronously();
 
     // מנגנון סינון תדרים לטריגר בלבד (Worker-thread בלבד)
     float pre_emphasis_state_{0.0f};
     float calculate_trigger_rms(const std::vector<float>& chunk);
+
+    // מונה שמיטת-כניסה (Overrun): נכתב על Thread ה-RT ב-on_audio_callback כשהתור
+    // מלא (בלתי-נגיש מעשית — חוצץ 5 שניות). uint32 מובטח Wait-Free בכל ה-ABIs
+    // (בניגוד ל-64-bit שעלול לנעול ב-armeabi-v7a). נקרא מה-Worker (טלמטריה) ומ-JNI.
+    std::atomic<uint32_t> input_overrun_count_{0};
+
+    // פיצוי לייטנסי-אוברדאב בדגימות (הלוך-ושוב: פלט+קלט). נכתב מ-OboeBridge
+    // בפתיחת הזרמים; נקרא על-ידי ה-Worker בכניסת אוברדאב. ראה set_overdub_latency_samples.
+    std::atomic<int> overdub_comp_samples_{0};
+
+    // חוצצי FFT לעקומת ה-Novelty — מוקצים *פעם אחת* בבנאי (NFFT קבוע, בלתי-תלוי
+    // בקצב הדגימה) ונעשה בהם שימוש-חוזר בכל בנייית לופ. Worker-thread בלבד:
+    // extract_novelty_curve הוא הקורא היחיד, ולכן אין נעילה. מבטל את kiss_fftr_alloc
+    // ואת הקצאות הווקטורים מנתיב ה-PROCESSING (הימנעות מנעילת Heap מיותרת).
+    static constexpr int kNoveltyNFFT = 1024;
+    kiss_fftr_cfg novelty_fft_cfg_ = nullptr;
+    std::vector<float>        novelty_hann_;       // חלון Hann מחושב-מראש (NFFT)
+    std::vector<kiss_fft_scalar> novelty_time_in_; // כניסת זמן (NFFT)
+    std::vector<kiss_fft_cpx>    novelty_freq_out_;// יציאת תדר (NFFT/2+1)
+    std::vector<float>        novelty_prev_mag_;   // מגניטודת החלון הקודם (NFFT/2+1)
 
     // --- מטרונום / Count-in (מצב SYNC) ---
     // נשמע ב-IDLE (ספירה-לתוך + נעילת קצב) וב-LOOPING/OVERDUBBING (סנכרון אוברדאב),
@@ -298,15 +342,17 @@ private:
     // היו מזהמים גם את ההקלטה וגם את זיהוי השקט. מצב הקליק נוגע רק ב-Thread של
     // ה-Output (process_output_callback), הפרמטרים אטומיים.
     std::atomic<bool> metronome_user_enabled_{true};
-    // ריברב על ה-Output (לא-הרסני): הלופ המוקלט נשאר יבש; הרטוב מתווסף בנגינה בלבד.
-    // reverb_wet_ = כמות הרטוב 0..1 (0 = יבש/כבוי), נשלט בכפתור.
-    std::atomic<float> reverb_wet_{0.0f};
-    FreeverbMono reverb_;
+    // (הריברב הגלובלי החי הוסר: כל הריברב הוא פר-שכבה, נצרב מראש ע"י ה-Worker
+    // אל samples — נתיב ה-Output קורא מיקס מוכן בלבד ואינו מריץ DSP ריברב.)
     double metro_free_counter_{0.0};   // מונה חופשי (IDLE); בנגינה נעול למיקום הלופ
     long   metro_last_beat_{-1};
     float  click_env_{0.0f};
-    double click_phase_{0.0};
+    double click_phase_{0.0};           // פאזת הקליק ב-*מחזורים* [0,1) (לא רדיאנים)
     float  click_freq_{1000.0f};
+    // טבלת גל sin לקליק המטרונום — מחושבת פעם אחת בבנאי; מחליפה std::sin פר-דגימה
+    // על Thread ה-Output. חזקה-של-2 → אינדוקס ב-mask. Worker/Output קורא בלבד.
+    static constexpr int kClickTableSize = 1024;
+    std::vector<float> click_sine_;
     void render_metronome(float* out, size_t num_frames, LooperState state,
                           bool playing, size_t loop_pos, size_t loop_size);
 
@@ -324,6 +370,11 @@ public:
     std::atomic<float> current_rms_{0.0f};
     std::atomic<float> current_noise_std_dev_{0.0f};
     std::atomic<bool> transient_hit_flag_{false};
+
+    // סה"כ דגימות-כניסה שנשמטו בגלל תור מלא (תצפית לקצה-מקרה פתולוגי; ~0 תמיד).
+    uint32_t get_input_overrun_count() const {
+        return input_overrun_count_.load(std::memory_order_relaxed);
+    }
 
     void execute_overdub_command();
     void execute_loop_command();
@@ -387,6 +438,13 @@ public:
     bool export_to_wav(const char* filepath);
     bool import_from_wav(const char* filepath);
 
+    // סשן רב-מסלולי (NTSN v1): שמירה/טעינה של *כל* השכבות — dry + gain/fx/reverb —
+    // כך ששחזור מחזיר את מבנה השכבות המלא (מחיקה/עריכה פר-שכבה שורדות ריסטארט),
+    // לא מיקס משוטח. save חוסם עד השלמת הכתיבה על-ידי ה-Worker (ראה שדות ה-pending);
+    // load היא מסירה א-סינכרונית בסגנון Import (true = פוענח ונמסר).
+    bool save_session(const char* filepath);
+    bool load_session(const char* filepath);
+
     // מדווח למנוע את קצב הדגימה האמיתי של החומרה ואת הלייטנסי שלה.
     // רק רושם בקשה; ה-Worker מחיל אותה בבטחה בתחילת האיטרציה שלו.
     void update_hardware_config(int sample_rate, float latency_seconds);
@@ -413,13 +471,15 @@ public:
         metronome_user_enabled_.store(on, std::memory_order_relaxed);
     }
 
-    void set_reverb_wet(float wet) {
-        reverb_wet_.store(std::clamp(wet, 0.0f, 1.0f), std::memory_order_relaxed);
+    // פיצוי לייטנסי-אוברדאב: הדגימה שמגיעה מהמיקרופון "עכשיו" נוגנה על-ידי
+    // המשתמש כנגד מה ששמע לפני (לייטנסי-פלט + לייטנסי-קלט) — בלי פיצוי כל
+    // אוברדאב נכתב באיחור סיסטמטי של סיבוב-הלוך-ושוב שלם ("פלאם" שמעי). נקבע
+    // על-ידי ה-OboeBridge בעת פתיחת הזרמים; ה-Worker מחסיר אותו מנקודת-הכניסה
+    // של האוברדאב. 0 = ללא פיצוי (מצב אופליין/Harness — אין שם רמקול↔מיקרופון).
+    void set_overdub_latency_samples(int samples) {
+        overdub_comp_samples_.store(std::max(0, samples), std::memory_order_relaxed);
     }
 
-    // אפקטים חיים על הלופ (0=none 1=reverse 2=octave-up 3=octave-down). מוחל
-    // על-ידי ה-Worker (מפרסם יחיד) כדי לשמור על מודל ה-RCU.
-    void request_effect(int fx) { request_effect_.store(fx, std::memory_order_relaxed); }
     // צילום מעטפת גל של הלופ הפעיל ל-bins שווים (Peak לכל bin). מוחזר מס' ה-bins.
     int get_loop_waveform(float* out, int max_bins);
 };
