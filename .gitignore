@@ -1,3 +1,15 @@
 cpp/includes
+cpp/headers/examples.wav
+cpp/headers/silence2.wav
+cpp/headers/soft_fingers.wav
+cpp/headers/hard_strum.wav
+cpp/headers/quick_mute.wav
+cpp/headers/main.cpp
+cpp/headers/main.exe
+cpp/headers/sweep.py
+cpp/headers/strum_start.txt
+cpp/take1.csv
+cpp/tools/*
+corpus/*
 keepRules
 res

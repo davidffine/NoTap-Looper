@@ -23,6 +23,9 @@ class SliderView(context: Context) : View(context) {
     var value: Float = 0f
         private set
     var onChange: ((Float) -> Unit)? = null
+    // Fired once on touch-up with the final value — for expensive commits (e.g. a
+    // per-layer reverb bake) that shouldn't run on every drag frame.
+    var onRelease: ((Float) -> Unit)? = null
     var accent: Int = Design.green
         set(v) { field = v; invalidate() }
 
@@ -137,6 +140,7 @@ class SliderView(context: Context) : View(context) {
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
                 parent?.requestDisallowInterceptTouchEvent(false)
+                if (e.action == MotionEvent.ACTION_UP) onRelease?.invoke(value)
                 return true
             }
         }
