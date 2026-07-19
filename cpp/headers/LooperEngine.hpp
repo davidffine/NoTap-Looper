@@ -105,6 +105,7 @@ struct SessionLayer {
     float gain = 1.0f;
     int   fx = 0;          // 0=none 1=reverse 2=oct-up 3=oct-down
     float reverb = 0.0f;
+    bool  denoise = false; // CLEAN (v2) — מחושב מחדש מה-dry בטעינה (המטמון לא נשמר)
 };
 
 // טלמטריה פר-צ'אנק עבור ה-Harness האופליין (כוונון אמפירי).
@@ -217,6 +218,13 @@ private:
     std::atomic<int>   layer_fx_[kMaxLayers]{};
     std::atomic<float> layer_gain_[kMaxLayers]{};
     std::atomic<float> layer_reverb_[kMaxLayers]{};
+
+    // CLEAN (שער ספקטרלי, Pro): פקודת הכל-או-כלום על *כל* השכבות — ערוץ פר-שכבה
+    // היה מאבד פקודות (Last-Write-Wins על תא יחיד), וכפתור ה-UI ממילא גלובלי.
+    // ‎-1=אין בקשה · 0=כבה-לכולן · 1=הדלק-לכולן. layer_denoise_count_ = כמה שכבות
+    // נקיות כרגע (מדווח ב-pollTelemetry[8]; שוויון ל-layer_count_ ⇒ הכפתור דולק).
+    std::atomic<int> req_denoise_all_{-1};
+    std::atomic<int> layer_denoise_count_{0};
 
     // בקשות קונפיגורציית חומרה: נרשמות כאן, מוחלות אך ורק על-ידי ה-Worker
     std::atomic<int> pending_sample_rate_{-1};
@@ -401,6 +409,11 @@ public:
         req_layer_reverb_val_.store(wet, std::memory_order_relaxed);
         req_layer_reverb_idx_.store(index, std::memory_order_release);
     }
+    // CLEAN: הדלקה/כיבוי של השער הספקטרלי על כל השכבות בבת-אחת (Worker מרנדר
+    // ומפרסם חלק). מס' השכבות הנקיות זורם ל-UI דרך pollTelemetry[8].
+    void set_denoise_all(bool on) { req_denoise_all_.store(on ? 1 : 0, std::memory_order_relaxed); }
+    int get_layer_denoise_count() const { return layer_denoise_count_.load(std::memory_order_relaxed); }
+
     int   get_layer_fx(int index) const {
         return (index >= 0 && index < kMaxLayers) ? layer_fx_[index].load(std::memory_order_relaxed) : 0;
     }

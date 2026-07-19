@@ -36,12 +36,12 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_executeRecordStop(JNIEn
 // הרנדר.) חוזה האינדקסים (מראה מדויקת ב-AudioEngine.kt/LooperViewModel):
 //   [0]=rms · [1]=noise_std · [2]=transient(0/1) · [3]=state ordinal (חוזה
 //   LooperState: 0=CAL 1=IDLE 2=REC 3=PROC 4=LOOP 5=OVERDUB) · [4]=bpm ·
-//   [5]=loop_beats · [6]=loop_pos(0..1) · [7]=layer_count
+//   [5]=loop_beats · [6]=loop_pos(0..1) · [7]=layer_count · [8]=denoised_count
 JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *env, jobject thiz, jfloatArray outData) {
     if (!g_engine || outData == nullptr) return;
-    if (env->GetArrayLength(outData) < 8) return;
+    if (env->GetArrayLength(outData) < 9) return;
 
-    jfloat telemetry[8];
+    jfloat telemetry[9];
     telemetry[0] = g_engine->current_rms_.load(std::memory_order_relaxed);
     telemetry[1] = g_engine->current_noise_std_dev_.load(std::memory_order_relaxed);
     // קריאה ואיפוס אטומי של דגל הטרנזיינט
@@ -51,9 +51,10 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *e
     telemetry[5] = g_engine->get_loop_beats();
     telemetry[6] = g_engine->get_loop_position();
     telemetry[7] = static_cast<jfloat>(g_engine->get_layer_count());
+    telemetry[8] = static_cast<jfloat>(g_engine->get_layer_denoise_count());
 
     // כתיבה חזרה למערך של Kotlin ללא הקצאות זיכרון חדשות
-    env->SetFloatArrayRegion(outData, 0, 8, telemetry);
+    env->SetFloatArrayRegion(outData, 0, 9, telemetry);
 }
 
 // תצפית: סה"כ דגימות-כניסה שנשמטו (תור מלא). ~0 תמיד; חשיפה לקצה-מקרה פתולוגי.
@@ -119,6 +120,12 @@ Java_com_notap_looper_AudioEngine_deleteLayer(JNIEnv *env, jobject thiz, jint in
     if (g_engine) {
         g_engine->delete_layer(static_cast<int>(index));
     }
+}
+
+// CLEAN (שער ספקטרלי, Pro): הדלקה/כיבוי על כל השכבות בבת-אחת.
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setDenoiseAll(JNIEnv *env, jobject thiz, jboolean on) {
+    if (g_engine) g_engine->set_denoise_all(on == JNI_TRUE);
 }
 
 // --- אפקטים פר-שכבה (פייז 3) ---

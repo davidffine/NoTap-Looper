@@ -1,6 +1,7 @@
 #include "../headers/LooperEngine.hpp"
 #include "../headers/OctaveResample.hpp"
 #include "../headers/PitchShift.hpp"
+#include "../headers/NoiseGate.hpp"
 #include "../includes/kissfft/kiss_fftr.h"
 #include "../headers/miniaudio.h"
 #include <iostream>
@@ -34,21 +35,24 @@ namespace {
     // reverb-bake (זנב Freeverb על סיבוב אחד) — כולם באורך loop_length_.
     struct Layer {
         std::vector<float> dry;       // ההקלטה הפריסטינית (אורך loop_length_)
-        std::vector<float> samples;   // מרונדר = fx∘reverb(dry); המיקס קורא מכאן
+        std::vector<float> samples;   // מרונדר = fx∘reverb∘clean(dry); המיקס קורא מכאן
         float gain = 1.0f;            // עוצמה חיה (מוחל במיקס, לא נצרב)
         int   fx = 0;                 // 0=none 1=reverse 2=oct-up 3=oct-down
         float reverb = 0.0f;          // כמות ריברב פר-שכבה, נצרבת ל-samples
+        bool  denoise = false;        // CLEAN: שער ספקטרלי על ה-dry (הפיך; dry לא נגוע)
+        std::vector<float> dry_denoised;  // מטמון — השער יקר (~2×FFT על הלופ); ריק = לא חושב
     };
 
-    // --- קובץ סשן NTSN v1 (שמירת-אוטומט רב-מסלולית, פנימי-למכשיר) ---
+    // --- קובץ סשן NTSN v2 (שמירת-אוטומט רב-מסלולית, פנימי-למכשיר) ---
     // header: magic "NTSN" · version u32 · sample_rate u32 · layer_count u32 ·
     //         loop_length u64 · bpm f32 · beats f32
-    // per-layer: gain f32 · fx i32 · reverb f32 · dry[loop_length] f32
+    // per-layer: gain f32 · fx i32 · reverb f32 · denoise i32 (v2) · dry[loop_length] f32
     // dry נשמר כ-float גולמי (שחזור ביט-מדויק; samples מרונדרים מחדש בטעינה).
+    // v2 מוסיף את דגל ה-CLEAN; v1 נדחה (מעולם לא רץ על מכשיר — אין קבצי v1 בעולם).
     // Little-endian בלבד — קובץ מקומי-למכשיר (ARM/x86 שניהם LE), לא פורמט חליפין.
     // כתיבה אטומית-בקירוב: tmp ואז rename, כך שקריסה באמצע לא משחיתה סשן קודם.
     constexpr char     kSessionMagic[4] = {'N','T','S','N'};
-    constexpr uint32_t kSessionVersion  = 1;
+    constexpr uint32_t kSessionVersion  = 2;
 
     inline bool write_session_file(const std::string& path, const std::vector<Layer>& layers,
                                    size_t loop_len, int sr, float bpm, float beats) {
@@ -66,7 +70,8 @@ namespace {
         put(&len64, 8); put(&bpm, 4); put(&beats, 4);
         for (const Layer& L : layers) {
             int32_t fx32 = L.fx;
-            put(&L.gain, 4); put(&fx32, 4); put(&L.reverb, 4);
+            int32_t dn32 = L.denoise ? 1 : 0;
+            put(&L.gain, 4); put(&fx32, 4); put(&L.reverb, 4); put(&dn32, 4);
             put(L.dry.data(), loop_len * sizeof(float));
         }
         f.flush();
@@ -733,30 +738,45 @@ void LooperEngine::process_audio_asynchronously() {
         Layer L;
         L.samples = audio;             // העתקה
         L.dry = std::move(audio);      // אותו תוכן — dry הפריסטיני
-        L.gain = 1.0f; L.fx = 0; L.reverb = 0.0f;
+        L.gain = 1.0f; L.fx = 0; L.reverb = 0.0f; L.denoise = false;
         return L;
     };
-    // רינדור-מחדש של samples מתוך dry לפי fx+reverb (שומר-אורך תמיד).
+    // רינדור-מחדש של samples מתוך dry: clean(dry) → fx → reverb (שומר-אורך תמיד).
+    // ה-CLEAN קודם ל-fx בכוונה: אוקטבת ה-Phase-Vocoder מורחת רעש רחב-סרט במיוחד,
+    // וריברב על אות נקי נשמע נקי. השער יקר (~2×FFT על הלופ) — נשמר במטמון
+    // dry_denoised ומחושב פעם אחת; dry עצמו לעולם לא נגוע (הפיכות מלאה).
     auto render_layer = [&](Layer& L) {
+        const std::vector<float>* src = &L.dry;
+        if (L.denoise) {
+            if (L.dry_denoised.size() != loop_length_)
+                L.dry_denoised = notap_dsp::denoise_loop(L.dry);
+            if (L.dry_denoised.size() == loop_length_) src = &L.dry_denoised;
+        } else if (!L.dry_denoised.empty()) {
+            L.dry_denoised.clear();
+            L.dry_denoised.shrink_to_fit();   // כבוי → שחרור המטמון (זיכרון לופ שלם)
+        }
         std::vector<float> base;
         switch (L.fx) {
-            case 1: base.assign(L.dry.rbegin(), L.dry.rend()); break;      // reverse (מדויק)
-            case 2: base = notap_dsp::octave_pitch(L.dry, true);  break;   // +אוקטבה (PV שומר-אורך)
-            case 3: base = notap_dsp::octave_pitch(L.dry, false); break;   // -אוקטבה
-            default: base = L.dry; break;
+            case 1: base.assign(src->rbegin(), src->rend()); break;        // reverse (מדויק)
+            case 2: base = notap_dsp::octave_pitch(*src, true);  break;    // +אוקטבה (PV שומר-אורך)
+            case 3: base = notap_dsp::octave_pitch(*src, false); break;    // -אוקטבה
+            default: base = *src; break;
         }
-        if (base.size() != loop_length_) base = L.dry;   // הגנה: fx נכשל/אורך לא תואם → dry
+        if (base.size() != loop_length_) base = *src;   // הגנה: fx נכשל/אורך לא תואם
         if (L.reverb > 0.001f) base = bake_reverb_loop(base, L.reverb, config_.sample_rate);
         L.samples = std::move(base);
     };
-    // מראה-מצב לכל השכבות (ספירה + fx/gain/reverb) לקריאת ה-UI דרך JNI.
+    // מראה-מצב לכל השכבות (ספירה + fx/gain/reverb/clean) לקריאת ה-UI דרך JNI.
     auto sync_layer_mirror = [&]() {
         int n = static_cast<int>(layers_.size());
+        int denoised = 0;
         for (int i = 0; i < n && i < kMaxLayers; ++i) {
             layer_fx_[i].store(layers_[i].fx, std::memory_order_relaxed);
             layer_gain_[i].store(layers_[i].gain, std::memory_order_relaxed);
             layer_reverb_[i].store(layers_[i].reverb, std::memory_order_relaxed);
+            if (layers_[i].denoise) ++denoised;
         }
+        layer_denoise_count_.store(denoised, std::memory_order_relaxed);
         layer_count_.store(n, std::memory_order_release);   // פרסום אחרון → מצב עקבי לקורא
     };
 
@@ -990,7 +1010,8 @@ void LooperEngine::process_audio_asynchronously() {
                         L.gain = std::clamp(sl.gain, 0.0f, 2.0f);
                         L.fx = sl.fx;
                         L.reverb = std::clamp(sl.reverb, 0.0f, 1.0f);
-                        render_layer(L);   // samples = fx∘reverb(dry) — צריבה טרייה
+                        L.denoise = sl.denoise;
+                        render_layer(L);   // samples = clean/fx/reverb(dry) — צריבה טרייה
                         layers_.push_back(std::move(L));
                     }
                 }
@@ -1517,6 +1538,25 @@ void LooperEngine::process_audio_asynchronously() {
                     req_layer_gain_idx_.store(-1, std::memory_order_relaxed);
                 }
 
+                // CLEAN לכל השכבות (Pro): הדלקה ראשונה מחשבת את השער לכל שכבה
+                // (~עשרות ms לשכבה, על ה-Worker — ההשמעה ממשיכה מהחוצץ המפורסם);
+                // חזרות/כיבוי זולים (מטמון dry_denoised). אידמפוטנטי ⇒ ניסיון-חוזר
+                // בטוח כשה-Slot תפוס, כמו שאר ערוצי הפקודה.
+                int dn = req_denoise_all_.load(std::memory_order_acquire);
+                if (dn >= 0 && !layers_.empty()) {
+                    bool on = (dn == 1);
+                    for (Layer& L : layers_) { L.denoise = on; render_layer(L); }
+                    render_full_mix_excluding(-1, mix_temp_);
+                    if (publish_mix_smoothed()) {
+                        req_denoise_all_.store(-1, std::memory_order_relaxed);
+                        sync_layer_mirror();
+                        std::cout << "[DSP] CLEAN " << (on ? "on" : "off")
+                                  << " (" << layers_.size() << " layers)." << std::endl;
+                    }
+                } else if (dn >= 0) {
+                    req_denoise_all_.store(-1, std::memory_order_relaxed);
+                }
+
                 if (request_overdub_.exchange(false, std::memory_order_relaxed)) {
                     // כניסה לאוברדאב: מקפיאים את סכום השכבות הקיימות (committed_mix_)
                     // ופותחים שכבה *חדשה* ריקה. המוניטור = committed_mix_ + new_layer_,
@@ -1572,8 +1612,21 @@ void LooperEngine::process_audio_asynchronously() {
                             request_looping_.store(false, std::memory_order_relaxed);
                             // קיבוע השכבה החדשה כשכבה נפרדת (dry+samples = הדאב, בלי fx).
                             // כניסת-האוברדאב חסמה בתקרה, ולכן מובטח מקום כאן.
-                            layers_.push_back(make_layer(new_layer_));
+                            Layer nl = make_layer(new_layer_);
+                            // ירושת CLEAN: אם כל השכבות הקיימות נקיות — גם הדאב החדש
+                            // (הטוגל מייצג "נקה את המיקס", לא רגע-בזמן). הפרסום המעודכן
+                            // הוא Best-Effort; Slot תפוס ⇒ הפקודה הגלובלית תרפא בהמשך.
+                            bool inherit_clean = !layers_.empty() &&
+                                std::all_of(layers_.begin(), layers_.end(),
+                                            [](const Layer& L) { return L.denoise; });
+                            if (inherit_clean) { nl.denoise = true; render_layer(nl); }
+                            layers_.push_back(std::move(nl));
                             sync_layer_mirror();
+                            if (inherit_clean) {
+                                render_full_mix_excluding(-1, mix_temp_);
+                                if (!publish_mix_smoothed())
+                                    req_denoise_all_.store(1, std::memory_order_relaxed);
+                            }
                             new_layer_.clear();
                             new_layer_.shrink_to_fit();
                             current_state_.store(LooperState::LOOPING, std::memory_order_release);
@@ -1751,9 +1804,10 @@ bool LooperEngine::load_session(const char* filepath) {
 
     std::vector<SessionLayer> sess(count);
     for (uint32_t k = 0; k < count; ++k) {
-        int32_t fx32 = 0;
-        get(&sess[k].gain, 4); get(&fx32, 4); get(&sess[k].reverb, 4);
+        int32_t fx32 = 0, dn32 = 0;
+        get(&sess[k].gain, 4); get(&fx32, 4); get(&sess[k].reverb, 4); get(&dn32, 4);
         sess[k].fx = (fx32 >= 0 && fx32 <= 3) ? fx32 : 0;
+        sess[k].denoise = (dn32 == 1);
         sess[k].dry.resize(static_cast<size_t>(len64));
         get(sess[k].dry.data(), static_cast<size_t>(len64) * sizeof(float));
         if (!f) return false;   // קובץ קטום/מושחת — נכשל נקי, שום דבר לא נמסר
