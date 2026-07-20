@@ -408,25 +408,14 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
-    //  Main FX dashboard = the CURRENT (newest) layer's FX editor. Each new
-    //  overdub makes a fresh layer current, so the dashboard resets to it. FLIP
-    //  and clearing stay free; OCT± and deep reverb are Pro. Effects apply to the
-    //  newest layer ONLY (per-layer, not the whole loop) — the LAYERS sheet edits
-    //  any other layer. (The old whole-loop applyLoopEffect/global reverb paths are
-    //  no longer driven from the UI.)
+    //  Main dashboard reverb = the CURRENT (newest) layer's reverb. Each new overdub
+    //  makes a fresh layer current, so the fader resets to it. ≤30% wet is free,
+    //  deeper is Pro. FLIP/OCT± are NOT here any more — per-layer fx is edited in
+    //  the LAYERS sheet via setLayerFx(index, kind), which names its target layer
+    //  explicitly. (The old whole-loop applyLoopEffect/global reverb paths are gone.)
     // ------------------------------------------------------------------
-    /** Newest layer index (the one the main dashboard edits); -1 if no loop. */
+    /** Newest layer index (the one the main fader edits); -1 if no loop. */
     private fun currentLayerIndex(): Int = _uiState.value.layerCount - 1
-
-    /** Set the current layer's fx (0=none 1=reverse 2=oct-up 3=oct-down). FLIP and
-     *  clearing are free; octaves are Pro (paywall + no-op if not Pro). */
-    fun setCurrentLayerFx(kind: Int) {
-        val idx = currentLayerIndex()
-        if (idx < 0) return
-        if ((kind == 2 || kind == 3) && !gate(if (kind == 2) "OCTAVE UP" else "OCTAVE DOWN")) return
-        audioEngine.setLayerFx(idx, kind)
-        track("effect_used", "fx=$kind layer=$idx")
-    }
 
     /** Main reverb slider DRAG — drives only the tutorial completion; the per-layer
      *  bake is costly so it happens on release (commitCurrentLayerReverb). */
@@ -540,29 +529,45 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     // ------------------------------------------------------------------
-    //  Per-layer effects (Pro). Applying an effect to a single layer is a
-    //  studio feature — gated behind the paywall. The setters no-op when not
-    //  Pro (the layers sheet shows an upsell banner instead of live controls,
-    //  so these are defense-in-depth); layerFxUpsell() raises the paywall.
-    //  fx kind: 0=none 1=reverse 2=octave-up 3=octave-down.
+    //  Per-layer effects. The LAYERS sheet is now the ONLY home for these, so it
+    //  shows REAL controls to every user and gates PER CONTROL instead of hiding
+    //  the whole strip behind one wall: FLIP + volume free, OCT± Pro, reverb ≤30%
+    //  free. Hiding the strip wholesale silently deleted the free FLIP that used
+    //  to live on the main dashboard — a free feature must not vanish just because
+    //  it moved screens. fx kind: 0=none 1=reverse 2=octave-up 3=octave-down.
     // ------------------------------------------------------------------
+    private fun layerInRange(index: Int) = index >= 0 && index < _uiState.value.layerCount
+
+    /** Per-layer fx (0=none 1=reverse 2=octave-up 3=octave-down). FLIP and clearing
+     *  are FREE, octaves are Pro — the exact split the main dashboard used to carry
+     *  before per-layer FX moved into the LAYERS sheet. Gating per CONTROL (not per
+     *  screen) is what keeps a free user's FLIP working after that move. */
     fun setLayerFx(index: Int, kind: Int) {
-        if (!_uiState.value.isPro || index < 0 || index >= _uiState.value.layerCount) return
+        if (!layerInRange(index)) return
+        if ((kind == 2 || kind == 3) && !gate(if (kind == 2) "OCTAVE UP" else "OCTAVE DOWN")) return
         audioEngine.setLayerFx(index, kind)
         track("layer_fx", "index=$index kind=$kind")
     }
 
+    /** Layer volume — FREE. It's a mixer fader, not an effect: balancing takes you
+     *  already recorded is basic hygiene, same reasoning as free layer-delete. */
     fun setLayerGain(index: Int, gain: Float) {
-        if (!_uiState.value.isPro || index < 0 || index >= _uiState.value.layerCount) return
+        if (!layerInRange(index)) return
         audioEngine.setLayerGain(index, gain)
     }
 
+    /** Per-layer reverb — Model A freemium, identical to the main reverb fader:
+     *  ≤30% wet is FREE, studio depth is Pro (clamp to the ceiling + paywall). */
     fun setLayerReverb(index: Int, wet: Float) {
-        if (!_uiState.value.isPro || index < 0 || index >= _uiState.value.layerCount) return
-        audioEngine.setLayerReverb(index, wet)
+        if (!layerInRange(index)) return
+        if (_uiState.value.isPro) { audioEngine.setLayerReverb(index, wet); return }
+        if (wet <= FREE_REVERB_MAX) {
+            audioEngine.setLayerReverb(index, wet)
+        } else {
+            audioEngine.setLayerReverb(index, FREE_REVERB_MAX)
+            if (!_uiState.value.showPaywall) gate("STUDIO REVERB")
+        }
     }
-
-    fun layerFxUpsell() { gate("PER-LAYER FX") }
 
     /** CLEAN (Pro): toggle the spectral noise gate on ALL layers. Room noise stacks
      *  with every overdub (5 layers ≈ +7dB hiss) — this pulls it back out, music-safe
@@ -604,13 +609,9 @@ class LooperViewModel(app: Application) : AndroidViewModel(app) {
         track("mode_selected", "mode=${modes[index]}")
     }
 
-    fun adjustTargetBpm(delta: Float) {
-        _uiState.update { state ->
-            val newBpm = (state.targetBpm + delta).coerceIn(40f, 300f) // חסימה גבולית הגיונית למוזיקה
-            audioEngine.setTargetBPM(newBpm)
-            state.copy(targetBpm = newBpm)
-        }
-    }
+    // (adjustTargetBpm removed with the BPM ± buttons — its only callers. Coarse
+    //  moves go through the slider, exact ones through the tap-to-type overlay,
+    //  both landing on setAbsoluteTargetBpm.)
 
     fun setAbsoluteTargetBpm(bpm: Float) {
         _uiState.update { state ->

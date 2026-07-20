@@ -47,6 +47,13 @@ import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
+    private companion object {
+        // Metronome toggle glyphs — one source so the icon and its muted twin can't
+        // drift apart between construction and the state binding.
+        const val METRO_ICON_ON = "🔊"
+        const val METRO_ICON_OFF = "🔇"
+    }
+
     private val viewModel: LooperViewModel by viewModels()
 
     private lateinit var visualizer: LoopVisualizerView
@@ -62,7 +69,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var metroToggle: TextView
     private var lastMetroOn: Boolean? = null
     private var lastBpmShown = -1
-    private lateinit var fxRow: LinearLayout
+    // (fxRow / FLIP / OCT± removed from the main dashboard — per-layer FX now lives
+    //  ONLY in the LAYERS sheet, where each layer owns its own strip.)
     private lateinit var reverbRow: LinearLayout
     private lateinit var reverbSlider: SliderView
     private lateinit var reverbWetLabel: TextView
@@ -73,6 +81,10 @@ class MainActivity : AppCompatActivity() {
     // circle continuously between the two sizes (shared-element / Flutter-Hero feel).
     private var heroMorphAnim: android.animation.ValueAnimator? = null
     private var lastModeIndex: Int? = null
+    private var heroMorphArmed = false          // one morph per layout pass, not one per trigger
+    private var heroCelebratePending = false    // loop just born → morph settles with an overshoot
+    private var lastEngineStateForAnim: EngineState? = null
+    private var layersRenderedCount = 0         // detects "a layer appeared" for the row-in animation
 
     private lateinit var bpmOverlay: FrameLayout
     private lateinit var bpmEditText: EditText
@@ -91,15 +103,7 @@ class MainActivity : AppCompatActivity() {
     private var coachPulseTarget: View? = null
     private lateinit var paywallOverlay: FrameLayout
     private lateinit var paywallFeatureLabel: TextView
-    private lateinit var flipPill: TextView
-    private lateinit var octDownPill: TextView
-    private lateinit var octUpPill: TextView
-    private lateinit var octDownBadge: TextView
-    private lateinit var octUpBadge: TextView
     private lateinit var reverbProBadge: TextView
-    // The main FX dashboard edits the CURRENT (newest) layer; this mirrors that
-    // layer's fx so the FLIP/OCT± pills render as toggles and reset per overdub.
-    private var mainFxKind = 0
 
     // Phase 4 chrome
     private lateinit var contextButton: TextView          // top-left: 💡 help ⇄ ✕ clear
@@ -133,6 +137,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cleanContainer: FrameLayout   // crown wrapper — visibility target
     private lateinit var cleanBadge: TextView
     private var lastCleanOn: Boolean? = null
+    private var layersBtnAnim: android.animation.ValueAnimator? = null
+    // Fade state for every height-changing bottom row. Lazy so they bind after
+    // buildBottom() has created the views; see setRowShown for the ordering rules.
+    private val bpmFader by lazy { RowFader(bpmStepper) }
+    private val reverbFader by lazy { RowFader(reverbRow) }
+    private val layersFader by lazy { RowFader(layersRow) }
 
     private var currentAccent = Design.cyan
     private var hasLoop = false
@@ -259,11 +269,24 @@ class MainActivity : AppCompatActivity() {
 
                 // Hero morph trigger — MUST run before the BPM stepper's visibility
                 // flips below, so it captures the orb's radius while the old layout
-                // is still in place. Only SYNC (mode 2) changes the hero's height.
+                // is still in place. Only SYNC (mode 2) changes the hero's height,
+                // but EVERY mode change gets a ring sweep: the instrument's character
+                // changed, and the orb is where that identity lives.
                 if (lastModeIndex != s.modeIndex) {
                     val prevMode = lastModeIndex
                     lastModeIndex = s.modeIndex
-                    if (prevMode != null && (prevMode == 2 || s.modeIndex == 2)) armHeroMorph()
+                    // Ring sweep on any mode change. The hero morph is NOT armed here:
+                    // the BPM card's exit is delayed by its fade, so the morph must be
+                    // armed at the instant the layout actually changes — see
+                    // setRowShown, which owns that timing for every row.
+                    if (prevMode != null) visualizer.fireRipple()
+                }
+                // Loop-is-born edge (PROCESSING → LOOPING): the app's magic moment.
+                // Flagged here, consumed by the morph the FX-row reveal arms below.
+                if (lastEngineStateForAnim != s.engineState) {
+                    if (lastEngineStateForAnim == EngineState.PROCESSING &&
+                        s.engineState == EngineState.LOOPING) heroCelebratePending = true
+                    lastEngineStateForAnim = s.engineState
                 }
 
                 // Tempo slot: while RECORDING it carries the live take timer — there's
@@ -292,11 +315,15 @@ class MainActivity : AppCompatActivity() {
                         bpmSlider.setValueSilently(sliderFromBpm(s.targetBpm))
                     }
                     bpmReadout.setTextColor(Design.violet)
-                    if (bpmStepper.visibility != View.VISIBLE) { beginControlTransition(); bpmStepper.visibility = View.VISIBLE }
+                    setRowShown(bpmFader, true)
                     if (lastMetroOn != s.metronomeEnabled) {
                         lastMetroOn = s.metronomeEnabled
                         val on = s.metronomeEnabled
-                        metroToggle.setTextColor(if (on) Design.green else Design.textLo)
+                        // Speaker ⇄ muted-speaker. The glyph carries the state; the
+                        // pill tint and a dimmed alpha reinforce it (emoji ignore
+                        // setTextColor, so tinting alone would signal nothing).
+                        metroToggle.text = if (on) METRO_ICON_ON else METRO_ICON_OFF
+                        metroToggle.alpha = if (on) 1f else 0.5f
                         metroToggle.background = Design.pill(
                             this@MainActivity,
                             if (on) Design.alpha(Design.green, 0.14f) else Design.surfaceHi,
@@ -307,7 +334,7 @@ class MainActivity : AppCompatActivity() {
                     lastBpmShown = -1   // re-arm the SYNC guard for next entry
                     bpmReadout.text = if (s.bpm > 0f) "♩ ${s.bpm.toInt()}" else "♩ – –"
                     bpmReadout.setTextColor(Design.textMid)
-                    if (bpmStepper.visibility != View.GONE) { beginControlTransition(); bpmStepper.visibility = View.GONE }
+                    setRowShown(bpmFader, false)
                 }
 
                 if (segmented.selected != s.modeIndex) segmented.setSelectedSilently(s.modeIndex)
@@ -357,19 +384,16 @@ class MainActivity : AppCompatActivity() {
                 // Controls are hidden during the "magic" phase, revealed from LAYER
                 // onward (feature discovery) and of course after onboarding.
                 val controlsRevealed = !s.onboardingActive || s.onboardingStage >= OnboardingStage.LAYER
-                // Progressive disclosure: during onboarding the FX/Reverb rows stay
-                // hidden through LISTEN_ROOM/FIRST_LOOP/LAYER and reveal ONLY at
+                // Progressive disclosure: during onboarding the reverb row stays
+                // hidden through LISTEN_ROOM/FIRST_LOOP/LAYER and reveals ONLY at
                 // ELEVATE — the scoped TransitionManager gives that a satisfying
                 // reveal. Outside onboarding: shown whenever a loop exists.
+                // (FLIP/OCT± no longer live here — per-layer FX is the LAYERS sheet's job.)
                 val fxRevealed = if (s.onboardingActive) s.onboardingStage == OnboardingStage.ELEVATE else true
                 val fxTarget = if (hasLoop && fxRevealed) View.VISIBLE else View.GONE
                 // Control rows fluidly fade/slide via a transition scoped to
                 // bottomCol ONLY (never a scene root containing the hero).
-                if (fxRow.visibility != fxTarget || reverbRow.visibility != fxTarget) {
-                    beginControlTransition()
-                    fxRow.visibility = fxTarget
-                    reverbRow.visibility = fxTarget
-                }
+                setRowShown(reverbFader, fxTarget == View.VISIBLE)
                 // Multi-track row: LAYERS appears in the settled LOOPING state once at
                 // least one overdub exists (layerCount ≥ 2). Gated to LOOPING (not
                 // mid-overdub) so a delete never queues behind a take. Hidden during
@@ -384,12 +408,25 @@ class MainActivity : AppCompatActivity() {
                     if (!s.onboardingActive && looping && s.layerCount >= 1) View.VISIBLE else View.GONE
                 val rowTarget =
                     if (layersBtnTarget == View.VISIBLE || cleanTarget == View.VISIBLE) View.VISIBLE else View.GONE
-                if (layersRow.visibility != rowTarget || layersButton.visibility != layersBtnTarget ||
-                    cleanContainer.visibility != cleanTarget) {
-                    beginControlTransition()
-                    layersButton.visibility = layersBtnTarget
-                    cleanContainer.visibility = cleanTarget
-                    layersRow.visibility = rowTarget
+                val layersRowShown = rowTarget == View.VISIBLE
+                if (layersFader.intent != layersRowShown) {
+                    // The whole row is appearing/disappearing. On the way IN, put the
+                    // children in their final state first so the row fades in already
+                    // correct; on the way OUT leave them alone — re-laying out children
+                    // mid-fade (CLEAN widening as LAYERS vanishes) reads as a glitch.
+                    if (layersRowShown) {
+                        layersBtnAnim?.cancel()
+                        resetLayersButtonParams(layersBtnTarget == View.VISIBLE)
+                        cleanContainer.visibility = cleanTarget
+                    }
+                    setRowShown(layersFader, layersRowShown)
+                } else if (layersRowShown) {
+                    // Row stays put; only its contents change (e.g. the last overdub was
+                    // deleted → LAYERS goes away and CLEAN must take the freed width).
+                    if (layersButton.visibility != layersBtnTarget)
+                        animateLayersButton(layersBtnTarget == View.VISIBLE)
+                    if (cleanContainer.visibility != cleanTarget)
+                        cleanContainer.visibility = cleanTarget
                 }
                 // CLEAN lit state: filled green when every layer is denoised.
                 if (lastCleanOn != s.cleanAllOn) {
@@ -470,7 +507,7 @@ class MainActivity : AppCompatActivity() {
                         // true and we leave the fader where they dragged it.
                         if (!s.isPro && s.paywallFeature.contains("REVERB")) {
                             reverbSlider.animateTo(freeReverbMax)
-                            reverbWetLabel.text = "WET 30%"
+                            reverbWetLabel.text = "${Math.round(freeReverbMax * 100)}%"
                         }
                     }
                 }
@@ -481,8 +518,6 @@ class MainActivity : AppCompatActivity() {
                     lastIsPro = s.isPro
                     isProNow = s.isPro
                     val badgeVis = if (s.isPro) View.GONE else View.VISIBLE
-                    octDownBadge.visibility = badgeVis
-                    octUpBadge.visibility = badgeVis
                     reverbProBadge.visibility = badgeVis
                     cleanBadge.visibility = badgeVis
                     // The free-tier line only exists for non-Pro users.
@@ -509,12 +544,24 @@ class MainActivity : AppCompatActivity() {
         val sub: String, val intensity: Float
     )
 
+    /** Mode is a FIRST-CLASS input here, not just a copy switch: at rest the orb
+     *  carries the MODE's identity colour — the same three tokens the segmented control
+     *  and the mode sheet already use (AUTO cyan · TAP amber · SYNC violet). So
+     *  switching modes while idle cross-fades the whole hero, which is what makes
+     *  the mode feel like a property of the instrument rather than a hidden
+     *  setting. The instant the engine is ACTIVE (rec/proc/loop/overdub) colour
+     *  reverts to STATE — urgency outranks identity, and those colours are the
+     *  ones a player reads from across a room. Because the accent still flows
+     *  through this single function, the binding remains the one source of truth
+     *  and no colour can ever get "stuck" out of sync with the engine. */
     private fun lookFor(state: EngineState, mode: Int): Look = when (state) {
         EngineState.CALIBRATING -> Look(Design.slate, "CALIBRATING", "WAIT",
             "Learning the room's noise floor…", 0.1f)
-        EngineState.IDLE, EngineState.UNKNOWN ->
-            if (mode == 1) Look(Design.cyan, "READY", "START", "Tap the orb to begin recording", 0.12f)
-            else Look(Design.cyan, "READY", "LISTEN", "Pluck a string to start the loop", 0.12f)
+        EngineState.IDLE, EngineState.UNKNOWN -> when (mode) {
+            1 -> Look(Design.amber, "READY", "START", "Tap the orb to begin recording", 0.12f)
+            2 -> Look(Design.violet, "READY", "LISTEN", "Pluck to start — I lock to your tempo", 0.12f)
+            else -> Look(Design.cyan, "READY", "LISTEN", "Pluck a string to start the loop", 0.12f)
+        }
         EngineState.RECORDING ->
             if (mode == 1) Look(Design.red, "RECORDING", "STOP", "Tap the orb to end the take", 1f)
             else Look(Design.red, "RECORDING", "REC", "Play your phrase — I stop when you do", 1f)
@@ -856,9 +903,47 @@ class MainActivity : AppCompatActivity() {
     /** Rebuild the layer rows for [count] live layers (index 0 = protected base,
      *  1..count-1 = deletable overdubs, newest last). */
     private fun populateLayersList(count: Int) {
+        // A layer appeared while the sheet was open (overdub committed) → slide the
+        // new row in instead of having the list blink to a new length. Only the
+        // newcomer animates; the rows above it are already where they belong.
+        val grew = count > layersRenderedCount && layersRenderedCount > 0
+        layersRenderedCount = count
         layersList.removeAllViews()
         for (index in 0 until count) {
             layersList.addView(layerRow(index, count))
+        }
+        if (grew) {
+            layersList.getChildAt(count - 1)?.let { fresh ->
+                fresh.alpha = 0f
+                fresh.translationY = dp(18).toFloat()
+                fresh.animate().alpha(1f).translationY(0f).setDuration(300)
+                    .setInterpolator(android.view.animation.DecelerateInterpolator()).start()
+            }
+        }
+    }
+
+    /** Collapse a layer row out of the list (fade + slide + height→0), then run
+     *  [onEnd]. The engine delete is deferred to the end action so the rebuild
+     *  driven by layerCount can't stomp the animation midway — the motion IS the
+     *  confirmation, and ~240ms before the audio changes is imperceptible. */
+    private fun animateLayerRowOut(row: View, onEnd: () -> Unit) {
+        val h = row.height
+        if (h <= 0) { onEnd(); return }
+        val lp = row.layoutParams
+        android.animation.ValueAnimator.ofFloat(1f, 0f).apply {
+            duration = 240
+            interpolator = android.view.animation.AccelerateInterpolator(1.4f)
+            addUpdateListener {
+                val f = it.animatedValue as Float
+                row.alpha = f
+                row.translationX = (1f - f) * dp(48)
+                lp.height = (h * f).toInt().coerceAtLeast(0)
+                row.layoutParams = lp          // re-assign drives the re-layout
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) = onEnd()
+            })
+            start()
         }
     }
 
@@ -919,8 +1004,11 @@ class MainActivity : AppCompatActivity() {
                 layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
                 setOnTouchListener { v, e ->
                     tapScale(v, e) {
-                        viewModel.deleteOverdub(index)
                         v.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                        // Collapse the row first; the engine delete fires on the end
+                        // action so the layerCount rebuild lands after the motion.
+                        v.isEnabled = false                 // no double-fire mid-collapse
+                        animateLayerRowOut(card) { viewModel.deleteOverdub(index) }
                     }
                     true
                 }
@@ -929,7 +1017,9 @@ class MainActivity : AppCompatActivity() {
         card.addView(header)
 
         // --- per-layer FX (Pro) ---
-        card.addView(if (isProNow) buildLayerFxStrip(index) else layerProUpsell())
+        // Real controls for EVERY user — gating happens per control inside the strip
+        // (FLIP + VOL free · OCT± Pro · REV ≤30% free), not by hiding the whole thing.
+        card.addView(buildLayerFxStrip(index))
         return card
     }
 
@@ -956,25 +1046,44 @@ class MainActivity : AppCompatActivity() {
             }
         }
         val fxRowV = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        // OCT± are Pro, FLIP is free. A Pro pill tapped by a free user raises the
+        // paywall and must NOT latch on — so the optimistic highlight only moves
+        // once we know the change was allowed.
         fun addFxPill(label: String, kind: Int, last: Boolean) {
+            val pro = (kind == 2 || kind == 3)
             val pill = TextView(this).apply {
                 text = label; textSize = 11.5f; gravity = Gravity.CENTER
                 typeface = Typeface.create("sans-serif-black", Typeface.NORMAL); letterSpacing = 0.04f
                 setPadding(0, dp(11), 0, dp(11))
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                layoutParams = if (pro) FrameLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                ) else LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                     .apply { if (!last) marginEnd = dp(8) }
                 setOnTouchListener { v, e ->
                     tapScale(v, e) {
-                        currentFx = if (currentFx == kind) 0 else kind
-                        viewModel.setLayerFx(index, currentFx)
-                        restyle()
+                        val next = if (currentFx == kind) 0 else kind
+                        // Turning a Pro effect ON without Pro → paywall, no state change.
+                        // Turning one OFF is always free (never trap a lapsed user).
+                        if (pro && next != 0 && !isProNow) {
+                            viewModel.setLayerFx(index, next)   // raises the paywall
+                        } else {
+                            currentFx = next
+                            viewModel.setLayerFx(index, next)
+                            restyle()
+                        }
                         v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     }
                     true
                 }
             }
             pills.add(pill to kind)
-            fxRowV.addView(pill)
+            if (pro) {
+                val (wrap, badge) = wrapWithCrown(pill, last)
+                badge.visibility = if (isProNow) View.GONE else View.VISIBLE
+                fxRowV.addView(wrap)
+            } else {
+                fxRowV.addView(pill)
+            }
         }
         addFxPill("FLIP", 1, false)
         addFxPill("OCT −", 3, false)
@@ -982,13 +1091,16 @@ class MainActivity : AppCompatActivity() {
         restyle()
         col.addView(fxRowV)
 
-        // VOL fader: slider 0..1 → gain 0..2 (0.5 = unity), applied live. REV fader:
-        // 0..1 wet, applied on RELEASE only — each reverb change re-bakes a Freeverb
-        // tail in the engine, far too costly to run on every drag frame.
+        // VOL fader: slider 0..1 → gain 0..2 (0.5 = unity), applied live — free, it's
+        // a mixer fader. REV fader: 0..1 wet, applied on RELEASE only (each change
+        // re-bakes a Freeverb tail, far too costly per drag frame); ≤30% free, the
+        // ViewModel clamps and raises the paywall beyond, and the amber freeMarker
+        // shows a free user exactly where that ceiling sits.
         col.addView(layerFader("VOL", Design.green, (viewModel.layerGain(index) / 2f),
             onChange = { v -> viewModel.setLayerGain(index, v * 2f) }))
         col.addView(layerFader("REV", Design.violet, viewModel.layerReverb(index),
-            onRelease = { v -> viewModel.setLayerReverb(index, v) }))
+            onRelease = { v -> viewModel.setLayerReverb(index, v) },
+            freeMarker = if (isProNow) -1f else freeReverbMax))
         return col
     }
 
@@ -996,7 +1108,8 @@ class MainActivity : AppCompatActivity() {
      *  live during the drag; [onRelease] fires once on touch-up (for costly commits). */
     private fun layerFader(
         label: String, accent: Int, initial: Float,
-        onChange: ((Float) -> Unit)? = null, onRelease: ((Float) -> Unit)? = null
+        onChange: ((Float) -> Unit)? = null, onRelease: ((Float) -> Unit)? = null,
+        freeMarker: Float = -1f
     ): View {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
@@ -1015,37 +1128,126 @@ class MainActivity : AppCompatActivity() {
             setValueSilently(initial.coerceIn(0f, 1f))
             this.onChange = onChange
             this.onRelease = onRelease
+            this.freeMarker = freeMarker   // amber tick + dimmed Pro zone (non-Pro only)
         })
         return row
     }
 
-    /** Non-Pro state for a layer's FX section: a single tap-to-unlock banner. */
-    private fun layerProUpsell(): View =
-        TextView(this).apply {
-            text = "👑  Per-layer FX — tap to unlock"
-            textSize = 11.5f; gravity = Gravity.CENTER; letterSpacing = 0.04f
-            setTextColor(Design.amber)
-            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
-            setShadowLayer(Design.dpf(Design.glowDp, context), 0f, 0f, Design.amber)
-            background = GradientDrawable().apply {
-                cornerRadius = Design.dpf(12, context)
-                setColor(Design.alpha(Design.amber, 0.10f)); setStroke(dp(1), Design.alpha(Design.amber, 0.4f))
+    // (layerProUpsell removed — the strip is no longer hidden behind one wall. Free
+    //  users get the real controls with per-control gating: crowns on OCT±, the amber
+    //  free-ceiling marker on REV. An upsell you can SEE and partly USE converts
+    //  better than a blank banner, and it doesn't delete anyone's free FLIP.)
+
+    /** Per-row fade state: the view, its INTENDED visibility, and the running fade. */
+    private class RowFader(val row: View) {
+        var intent: Boolean? = null
+        var anim: android.animation.ValueAnimator? = null
+    }
+
+    /** Fade ANY bottom-control row in/out, with the hero morph correctly ordered
+     *  around it. Every row that changes the bottom column's height goes through
+     *  here — the BPM card, the reverb card and the LAYERS/CLEAN row — so they all
+     *  behave identically whether they're revealed by a mode switch, a loop
+     *  starting, or ✕ clearing the loop.
+     *
+     *  ENTER: claim the space FIRST (arm the morph, go visible) so the circle starts
+     *  gliding away immediately, then fade the row into the gap it just vacated —
+     *  they move apart, so they can never overlap.
+     *
+     *  EXIT: fade the row out FIRST, and only free its space once it's invisible.
+     *  The reverse order is what made a disappearing card cover the circle:
+     *  bottomCol draws ABOVE the hero, so releasing the space immediately sent the
+     *  circle expanding into a region the row was still being painted over.
+     *
+     *  Replaces AutoTransition for these rows entirely. AutoTransition runs
+     *  fade→bounds→fade SEQUENTIALLY (3× the set's duration) and its ChangeBounds
+     *  resizes without re-measuring, so it both outlived the morph and mangled
+     *  TextView widths. Hand-rolling keeps the ordering explicit.
+     *
+     *  Edge-guarded on INTENT, never on current visibility: observe() runs at 60fps
+     *  and the exit path deliberately defers GONE until the fade ends, so a
+     *  visibility check would re-enter every frame and restart the fade forever. */
+    private fun setRowShown(state: RowFader, show: Boolean) {
+        if (state.intent == show) return
+        state.intent = show
+        state.anim?.cancel()
+        val row = state.row
+        var cancelled = false
+        if (show) {
+            armHeroMorph()                       // layout changes on the next pass
+            row.alpha = 0f
+            row.visibility = View.VISIBLE
+            state.anim = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+                duration = 260
+                interpolator = android.view.animation.DecelerateInterpolator()
+                addUpdateListener { row.alpha = it.animatedValue as Float }
+                start()
             }
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(12) }
-            setOnTouchListener { v, e ->
-                tapScale(v, e) {
-                    // Close the sheet first — the paywall overlay is below it in z-order.
-                    hideLayersSheet(); viewModel.layerFxUpsell()
-                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                }
-                true
+        } else {
+            state.anim = android.animation.ValueAnimator.ofFloat(row.alpha, 0f).apply {
+                duration = 170                   // brisk: the circle is waiting on it
+                interpolator = android.view.animation.AccelerateInterpolator()
+                addUpdateListener { row.alpha = it.animatedValue as Float }
+                addListener(object : android.animation.AnimatorListenerAdapter() {
+                    override fun onAnimationCancel(a: android.animation.Animator) { cancelled = true }
+                    override fun onAnimationEnd(a: android.animation.Animator) {
+                        if (cancelled) return    // a re-show interrupted us — leave it visible
+                        armHeroMorph()           // NOW the space is freed → circle glides in
+                        row.visibility = View.GONE
+                        row.alpha = 1f           // reset for the next reveal
+                    }
+                })
+                start()
             }
         }
+    }
+
+    /** Show/hide the LAYERS pill by animating its LAYOUT WEIGHT — not with
+     *  AutoTransition. AutoTransition's ChangeBounds animates bounds through
+     *  setLeftTopRightBottom and never re-measures, so a TextView keeps the text
+     *  layout from its previous width: the centred label renders clipped ("cut in
+     *  the middle") and the pill can settle at a stale width, leaving CLEAN
+     *  without the space LAYERS just freed. Animating the weight forces a real
+     *  measure+layout every frame, so CLEAN genuinely grows into the gap and both
+     *  labels stay correctly centred the whole way. */
+    private fun animateLayersButton(show: Boolean) {
+        layersBtnAnim?.cancel()
+        val lp = layersButton.layoutParams as LinearLayout.LayoutParams
+        if (show) layersButton.visibility = View.VISIBLE
+        layersBtnAnim = android.animation.ValueAnimator.ofFloat(
+            if (show) 0f else 1f, if (show) 1f else 0f
+        ).apply {
+            duration = 260
+            interpolator = android.view.animation.PathInterpolator(0.05f, 0.7f, 0.1f, 1f)
+            addUpdateListener {
+                val f = it.animatedValue as Float
+                lp.weight = f.coerceAtLeast(0.0001f)   // 0 weight + width 0 ⇒ collapsed
+                lp.marginEnd = (dp(8) * f).toInt()     // the gap closes with it
+                layersButton.alpha = f
+                layersButton.layoutParams = lp         // re-assign ⇒ requestLayout ⇒ true re-measure
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) =
+                    resetLayersButtonParams(show)
+            })
+            start()
+        }
+    }
+
+    /** Restore the pill's resting params (full weight + gap) and set its final
+     *  visibility, so a finished or cancelled collapse can never strand it at
+     *  zero weight. */
+    private fun resetLayersButtonParams(visible: Boolean) {
+        val lp = layersButton.layoutParams as LinearLayout.LayoutParams
+        lp.weight = 1f
+        lp.marginEnd = dp(8)
+        layersButton.alpha = 1f
+        layersButton.visibility = if (visible) View.VISIBLE else View.GONE
+        layersButton.layoutParams = lp
+    }
 
     private fun showLayersSheet() {
+        layersRenderedCount = 0   // fresh open: render the list as-is, nothing "grew"
         populateLayersList(viewModel.uiState.value.layerCount)
         layersSheet.visibility = View.VISIBLE
         layersSheet.alpha = 0f
@@ -1059,22 +1261,21 @@ class MainActivity : AppCompatActivity() {
         layersPanel.animate().translationY(dp(360).toFloat()).setDuration(200).start()
         layersSheet.animate().alpha(0f).setDuration(200)
             .withEndAction { layersSheet.visibility = View.GONE }.start()
-        // The sheet can edit the CURRENT layer too — resync the main dashboard so
-        // its toggles/faders never show stale state after the sheet closes.
+        // The sheet can edit the CURRENT layer's reverb too — resync the main fader
+        // so it never shows stale state after the sheet closes.
         reseedMainFxDashboard()
     }
 
-    /** Re-seed the main FX dashboard (pills + reverb fader) from the current
-     *  (newest) layer's live engine state. */
+    /** Re-seed the main reverb fader from the current (newest) layer's live engine
+     *  state. (The FLIP/OCT± pills that used to live here are gone — per-layer FX
+     *  is edited in the LAYERS sheet.) */
     private fun reseedMainFxDashboard() {
         val cur = viewModel.uiState.value.layerCount - 1
         if (cur < 0) return
-        mainFxKind = viewModel.layerFx(cur)
-        restyleMainFx()
         val rv = viewModel.layerReverb(cur)
         reverbSlider.setValueSilently(rv)
         val shown = if (isProNow) rv else minOf(rv, freeReverbMax)
-        reverbWetLabel.text = "WET ${Math.round(shown * 100)}%"
+        reverbWetLabel.text = "${Math.round(shown * 100)}%"
     }
 
     private fun buildTelemetryStrip(): View {
@@ -1170,8 +1371,11 @@ class MainActivity : AppCompatActivity() {
             when (e.action) {
                 MotionEvent.ACTION_DOWN -> {
                     // A press takes over the orb's scale — drop any in-flight morph so
-                    // the two animators never fight over scaleX/scaleY.
+                    // the two animators never fight over scaleX/scaleY, and settle the
+                    // transform to identity (the press animator only touches scale, so
+                    // a leftover translationY would strand the orb off-centre forever).
                     heroMorphAnim?.cancel(); heroMorphAnim = null
+                    setHeroTransform(0f, 1f)
                     heroContainer.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
                     visualizer.animate().scaleX(0.94f).scaleY(0.94f).setDuration(70).start()
                     labels.animate().scaleX(0.94f).scaleY(0.94f).setDuration(70).start()
@@ -1216,44 +1420,118 @@ class MainActivity : AppCompatActivity() {
     //  to 1.0. The user never sees the jump — only one circle changing size.
     //  Cost: two view properties on a hardware layer; zero allocation per frame.
     // ---------------------------------------------------------------------
+    //  Every bottom-row reveal (BPM stepper on SYNC · FX+reverb rows when a loop
+    //  starts/ends · LAYERS/CLEAN row) resizes the hero, so they all arm this.
+    //  Armed once per layout pass: several rows can change in the same observe
+    //  tick, and each must not queue its own morph.
+    /** The orb's drawn centre in window coords. This — not the radius — is what
+     *  actually jumps: the circle is drawn at height/2, so shrinking the hero band
+     *  by the stepper's ~100dp slides the centre up ~50dp. (On most phones the
+     *  radius is WIDTH-limited via min(w,h), so it often doesn't change at all —
+     *  which is why a scale-only morph animated nothing and the jump remained.)
+     *  Includes any in-flight transform, so it reports where the orb *looks*. */
+    private fun heroCenterYInWindow(): Float {
+        val loc = IntArray(2)
+        visualizer.getLocationInWindow(loc)
+        return loc[1] + visualizer.height / 2f
+    }
+
+    private fun setHeroTransform(ty: Float, sc: Float) {
+        visualizer.translationY = ty; visualizer.scaleX = sc; visualizer.scaleY = sc
+        heroLabels.translationY = ty; heroLabels.scaleX = sc; heroLabels.scaleY = sc
+    }
+
     private fun armHeroMorph() {
-        // scaleX folds in an in-flight morph, so rapid mode-toggling chains smoothly
-        // from wherever the circle currently *looks*, never from a stale radius.
+        if (heroMorphArmed) return
+        if (visualizer.height <= 0) return                 // not laid out yet
+        // Capture where the circle currently *looks* — both values fold in an
+        // in-flight morph, so rapid toggling chains smoothly instead of snapping
+        // back to a stale layout position.
+        val fromCenterY = heroCenterYInWindow()
         val fromRadius = visualizer.orbRadius() * visualizer.scaleX
-        if (fromRadius <= 1f) return                       // not laid out yet
         val vto = visualizer.viewTreeObserver
         if (!vto.isAlive) return
+        heroMorphArmed = true
         vto.addOnPreDrawListener(object : android.view.ViewTreeObserver.OnPreDrawListener {
             override fun onPreDraw(): Boolean {
                 visualizer.viewTreeObserver.removeOnPreDrawListener(this)
-                startHeroMorph(fromRadius)
+                heroMorphArmed = false
+                startHeroMorph(fromCenterY, fromRadius)
                 return true                                // let this frame draw
             }
         })
     }
 
-    private fun startHeroMorph(fromRadius: Float) {
-        val newRadius = visualizer.orbRadius()
-        if (newRadius <= 1f) return
-        val from = (fromRadius / newRadius).coerceIn(0.55f, 1.8f)
-        if (kotlin.math.abs(from - 1f) < 0.02f) return     // hero didn't actually resize
+    private fun startHeroMorph(fromCenterY: Float, fromRadius: Float) {
+        // A loop being born coincides with the FX rows appearing (= a hero resize),
+        // so the celebration rides the SAME animator instead of fighting it: same
+        // morph, but it settles with an overshoot and a burst of rings.
+        val celebrate = heroCelebratePending
+        heroCelebratePending = false
+
         heroMorphAnim?.cancel()
-        heroMorphAnim = android.animation.ValueAnimator.ofFloat(from, 1f).apply {
-            duration = 560
+        // Measure the settled target with an IDENTITY transform — a previous morph
+        // may still have translation/scale on these views, which would poison the
+        // reading. Safe to do mid-preDraw: nothing has been painted this frame yet.
+        setHeroTransform(0f, 1f)
+        val toCenterY = heroCenterYInWindow()
+        val newRadius = visualizer.orbRadius()
+
+        val dy = fromCenterY - toCenterY                   // px the orb must travel
+        val s0 = if (newRadius > 1f) (fromRadius / newRadius).coerceIn(0.55f, 1.8f) else 1f
+        val moved = kotlin.math.abs(dy) >= 1f
+        val resized = kotlin.math.abs(s0 - 1f) >= 0.02f
+        if (!moved && !resized) {                          // geometry didn't actually change
+            if (celebrate) playHeroBloom()
+            return
+        }
+
+        // k: 1 = "still at the old place/size", 0 = settled into the new layout.
+        heroMorphAnim = android.animation.ValueAnimator.ofFloat(1f, 0f).apply {
+            duration = if (celebrate) 640 else 480
             // Material "emphasized decelerate" — quick departure, long graceful
             // settle. This is the motion signature of a shared-element transition;
             // a symmetric ease would read as a resize, not as one element moving.
-            interpolator = android.view.animation.PathInterpolator(0.05f, 0.7f, 0.1f, 1f)
+            interpolator = if (celebrate) OvershootInterpolator(1.4f)
+                           else android.view.animation.PathInterpolator(0.05f, 0.7f, 0.1f, 1f)
             addUpdateListener {
-                val sc = it.animatedValue as Float
-                visualizer.scaleX = sc; visualizer.scaleY = sc
-                heroLabels.scaleX = sc; heroLabels.scaleY = sc
+                val k = it.animatedValue as Float          // may pass below 0 on overshoot
+                setHeroTransform(dy * k, 1f + (s0 - 1f) * k)
             }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) = setHeroTransform(0f, 1f)
+            })
             start()
         }
-        // One pooled ring from the existing ripple emitter — the circle reads as
-        // re-forming at its new size rather than merely being rescaled.
+        if (celebrate) fireRippleBurst()
+    }
+
+    /** The loop-is-born celebration when the hero did NOT resize: a symmetric
+     *  bell-curve swell (1 → 1.07 → 1) plus the ring burst. Never overlaps a
+     *  morph — startHeroMorph folds the celebration in when both apply. */
+    private fun playHeroBloom() {
+        heroMorphAnim?.cancel()
+        heroMorphAnim = android.animation.ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 720
+            interpolator = android.view.animation.DecelerateInterpolator()
+            addUpdateListener {
+                val t = it.animatedValue as Float
+                setHeroTransform(0f, 1f + 0.07f * kotlin.math.sin(t * Math.PI).toFloat())
+            }
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(a: android.animation.Animator) = setHeroTransform(0f, 1f)
+            })
+            start()
+        }
+        fireRippleBurst()
+    }
+
+    /** Three staggered rings from the visualizer's fixed pool (no allocation) —
+     *  reads as energy radiating out of the orb. */
+    private fun fireRippleBurst() {
         visualizer.fireRipple()
+        visualizer.postDelayed({ visualizer.fireRipple() }, 90)
+        visualizer.postDelayed({ visualizer.fireRipple() }, 180)
     }
 
     private fun buildBottom(): View {
@@ -1265,38 +1543,70 @@ class MainActivity : AppCompatActivity() {
         }
         bottomCol = col
 
-        // BPM control (SYNC mode only): a ± row for ±1 micro-steps, PLUS a
-        // continuous drag slider for macro moves across 40–300 BPM.
+        // BPM control (SYNC mode only) — ONE compact row: [120 BPM] · slider · CLICK.
+        // Was two rows (± steppers above a full-width slider); the ± buttons are
+        // gone because the slider plus the tap-to-type overlay already cover both
+        // coarse and exact entry. Collapsing to a single row gives the hero band
+        // back ~50dp, which is radius the circle keeps in SYNC mode.
         bpmStepper = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
             background = Design.glass(context, 16f)
-            setPadding(dp(10), dp(8), dp(10), dp(10))
+            setPadding(dp(14), dp(6), dp(10), dp(6))
             visibility = View.GONE
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
             ).apply { bottomMargin = dp(10) }
         }
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
-        }
-        val minus = stepButton("−") { viewModel.adjustTargetBpm(-1f) }
-        val plus = stepButton("+") { viewModel.adjustTargetBpm(1f) }
         bpmStepValue = TextView(this).apply {
-            text = "120"; textSize = 20f; gravity = Gravity.CENTER
+            text = "120"; textSize = 19f
             setTextColor(Design.violet); typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
             setShadowLayer(Design.dpf(7f, context), 0f, 0f, Design.violet)   // backlit-segment glow
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-            setOnClickListener { openBpmOverlay() }
         }
         val bpmTag = TextView(this).apply {
-            text = "BPM"; textSize = 10f; setTextColor(Design.textLo)
-            letterSpacing = 0.2f; setPadding(0, 0, dp(12), 0)
+            text = "BPM"; textSize = 9f; setTextColor(Design.textLo)
+            letterSpacing = 0.14f; setPadding(dp(3), dp(4), 0, 0)            // optically baseline-aligned
         }
+        // Value + unit act as one tap target → the numeric entry overlay.
+        // Pinned LTR: on an RTL device locale a horizontal LinearLayout reverses
+        // child order, which rendered the readout as "BPM 120". The value must
+        // always lead its unit ("120 BPM"), exactly like the coach pill pins its
+        // trailing control. Numbers+unit are LTR in every locale anyway.
+        val bpmValueGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            setPadding(0, dp(6), 0, dp(6))
+            addView(bpmStepValue); addView(bpmTag)
+            setOnTouchListener { v, e -> tapScale(v, e) { openBpmOverlay() }; true }
+        }
+
+        // Macro drag: maps 0..1 → 40..300 BPM. Weighted so it takes exactly the gap
+        // between the readout and CLICK. The binding echoes values back with
+        // setValueSilently (no onChange) so the two never feed back.
+        bpmSlider = SliderView(this).apply {
+            accent = Design.violet
+            // 120 BPM landmark: a tick on the track, a magnetic catch, and a detent
+            // bump — so the most common tempo is findable at a glance, by feel, AND
+            // actually landable. The full 40–300 range is compressed into ~190dp, so
+            // 1 BPM is well under a pixel of travel: without a magnet, hitting exactly
+            // 120 by drag is luck. The window is ±3 BPM — narrower than the finger can
+            // resolve anyway — and any exact tempo is still reachable by tapping the
+            // readout to type it.
+            detent = sliderFromBpm(120f)
+            detentSnap = sliderFromBpm(123f) - sliderFromBpm(120f)
+            layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply {
+                marginStart = dp(10); marginEnd = dp(8)
+            }
+            onChange = { v -> viewModel.setAbsoluteTargetBpm(bpmFromSlider(v)) }
+        }
+
+        // Metronome toggle — a speaker icon that becomes a muted speaker when off,
+        // so the state is legible from the glyph alone (the pill's tint reinforces
+        // it). Emoji render in their own colours, so the on/off signal lives in the
+        // glyph + background + alpha rather than in setTextColor.
         metroToggle = TextView(this).apply {
-            text = "CLICK"; textSize = 11f; gravity = Gravity.CENTER
-            letterSpacing = 0.12f
-            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
-            setPadding(dp(14), dp(9), dp(14), dp(9))
+            text = METRO_ICON_ON; textSize = 15f; gravity = Gravity.CENTER
+            setPadding(dp(11), dp(7), dp(11), dp(7))
             setOnTouchListener { v, e ->
                 tapScale(v, e) {
                     viewModel.toggleMetronome()
@@ -1304,105 +1614,79 @@ class MainActivity : AppCompatActivity() {
                 }
                 true
             }
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { marginEnd = dp(6) }
-        }
-        row.addView(metroToggle)
-        row.addView(minus)
-        row.addView(bpmStepValue)
-        row.addView(bpmTag)
-        row.addView(plus)
-
-        // Macro drag: maps 0..1 → 40..300 BPM. onChange stores via the same
-        // clamping setter the ± use; the binding echoes the value back to the
-        // slider with setValueSilently (no onChange) so the two never feed back.
-        bpmSlider = SliderView(this).apply {
-            accent = Design.violet
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(36)
-            ).apply { topMargin = dp(4) }
-            onChange = { v -> viewModel.setAbsoluteTargetBpm(bpmFromSlider(v)) }
         }
 
-        bpmStepper.addView(row)
+        bpmStepper.addView(bpmValueGroup)
         bpmStepper.addView(bpmSlider)
+        bpmStepper.addView(metroToggle)
 
-        // Live loop effects (appear only while a loop is playing)
-        fxRow = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            visibility = View.GONE
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
-        }
-        // The main FX pills are now TOGGLES for the current (newest) layer's fx —
-        // a layer holds one fx at a time, so they're mutually exclusive; tapping the
-        // active one clears it. FLIP is free; OCT± are Pro (crown badge when not Pro).
-        flipPill = fxPill("FLIP", Design.violet, false) { onMainFxTap(1) }
-        fxRow.addView(flipPill)
-        octDownPill = fxPill("OCT –", Design.cyan, false) { onMainFxTap(3) }
-        octUpPill = fxPill("OCT +", Design.amber, true) { onMainFxTap(2) }
-        val (octDownWrap, dBadge) = wrapWithCrown(octDownPill, last = false)
-        val (octUpWrap, uBadge) = wrapWithCrown(octUpPill, last = true)
-        octDownBadge = dBadge; octUpBadge = uBadge
-        fxRow.addView(octDownWrap)
-        fxRow.addView(octUpWrap)
-        restyleMainFx()
+        // (The FLIP / OCT– / OCT+ row lived here and edited the newest layer. It's
+        //  gone: per-layer FX belongs to the LAYERS sheet, where every layer has its
+        //  own strip and it's unambiguous WHICH layer you're changing. That also
+        //  frees another row of height back to the hero.)
 
-        // Reverb wet slider (appears with the fx row while looping)
+        // Reverb — ONE compact row, matching the BPM card: [REVERB 👑] · slider · [30%].
+        // Was a header line stacked over a full-width slider (~86dp); now ~46dp, and
+        // that height goes back to the hero. The slider is inset from BOTH ends so it
+        // never crowds the label or the readout.
         reverbRow = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            visibility = View.GONE
-            background = Design.glass(context, 16f)
-            setPadding(dp(16), dp(12), dp(16), dp(10))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
-        }
-        val reverbHeader = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
+            visibility = View.GONE
+            background = Design.glass(context, 16f)
+            setPadding(dp(14), dp(6), dp(12), dp(6))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { bottomMargin = dp(10) }
         }
-        reverbHeader.addView(TextView(this@MainActivity).apply {
-            text = "REVERB"; textSize = 13f; letterSpacing = 0.12f
-            setTextColor(Design.textHi); typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
-        })
-        // Crown hint: communicates the free ceiling ("30%+ is Pro") up front, so
-        // dragging past it is expected, not click-frustration. Hidden when Pro.
+        // Crown hint: signals up front that this control has a Pro ceiling, so
+        // dragging past it is expected rather than click-frustration. The exact
+        // boundary is drawn ON the slider (freeMarker tick + dimmed locked zone),
+        // so the old "30%+" text was redundant once the row got tight. Hidden when Pro.
         reverbProBadge = TextView(this).apply {
-            text = "👑 30%+"; textSize = 10f; letterSpacing = 0.06f
-            setTextColor(Design.amber)
-            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+            text = "👑"; textSize = 10f
             setShadowLayer(Design.dpf(Design.glowDp, context), 0f, 0f, Design.amber)
-            setPadding(dp(8), 0, 0, 0)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setPadding(dp(4), 0, 0, 0)
         }
-        reverbHeader.addView(reverbProBadge)
+        // Label + crown read as one unit; pinned LTR so an RTL locale can't put the
+        // crown before the word (same reason the BPM readout is pinned).
+        val reverbLabelGroup = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            layoutDirection = View.LAYOUT_DIRECTION_LTR
+            addView(TextView(this@MainActivity).apply {
+                text = "REVERB"; textSize = 11.5f; letterSpacing = 0.1f
+                setTextColor(Design.textHi)
+                typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
+            })
+            addView(reverbProBadge)
+        }
         reverbWetLabel = TextView(this).apply {
-            text = "WET 0%"; textSize = 12f; setTextColor(Design.green)
+            text = "0%"; textSize = 12f; gravity = Gravity.END
+            setTextColor(Design.green)
             typeface = Typeface.MONOSPACE
             setShadowLayer(Design.dpf(6f, context), 0f, 0f, Design.green)   // backlit-segment glow
+            // Fixed width so the slider doesn't twitch as the readout grows 0%→100%.
+            layoutParams = LinearLayout.LayoutParams(dp(38), ViewGroup.LayoutParams.WRAP_CONTENT)
         }
-        reverbHeader.addView(reverbWetLabel)
         reverbSlider = SliderView(this).apply {
             accent = Design.green
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(40)
-            ).apply { topMargin = dp(6) }
+            layoutParams = LinearLayout.LayoutParams(0, dp(34), 1f).apply {
+                marginStart = dp(12); marginEnd = dp(10)
+            }
             onChange = { v ->
                 // Live: drive tutorial completion + the readout only. The per-layer
                 // reverb bake is costly, so it's committed on RELEASE (below).
                 viewModel.onCurrentLayerReverbChange(v)
                 val shown = if (isProNow || reverbTasteWindow) v else minOf(v, freeReverbMax)
-                reverbWetLabel.text = "WET ${Math.round(shown * 100)}%"
+                reverbWetLabel.text = "${Math.round(shown * 100)}%"
             }
             // Bake the current (newest) layer's reverb on release — ≤30% free, deeper
             // is Pro (clamp + paywall).
             onRelease = { v -> viewModel.commitCurrentLayerReverb(v) }
         }
-        reverbRow.addView(reverbHeader)
+        reverbRow.addView(reverbLabelGroup)
         reverbRow.addView(reverbSlider)
+        reverbRow.addView(reverbWetLabel)
 
         // Multi-track row: "LAYERS · N" (appears once overdubs exist — tap → the
         // layers sheet) beside "✨ CLEAN" (Pro spectral noise gate on the whole
@@ -1466,53 +1750,15 @@ class MainActivity : AppCompatActivity() {
 
         col.addView(bpmStepper)
         col.addView(layersRow)
-        col.addView(fxRow)
         col.addView(reverbRow)
         col.addView(segmented)
         return col
     }
 
-    private fun fxPill(label: String, color: Int, last: Boolean, onClick: () -> Unit): TextView =
-        TextView(this).apply {
-            text = label; textSize = 12f; gravity = Gravity.CENTER
-            setTextColor(color); letterSpacing = 0.08f
-            typeface = Typeface.create("sans-serif-black", Typeface.NORMAL)
-            setPadding(0, dp(14), 0, dp(14))
-            background = Design.glass(context, 14f)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                .apply { if (!last) marginEnd = dp(8) }
-            setOnTouchListener { v, e ->
-                tapScale(v, e) { onClick(); v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY) }
-                true
-            }
-        }
-
-    /** Tap a main-dashboard FX pill (kind: 1=FLIP 2=OCT+ 3=OCT−). Toggles the
-     *  current layer's fx (tap active → clear). Turning ON an octave when not Pro
-     *  raises the paywall and leaves the highlight unchanged. */
-    private fun onMainFxTap(kind: Int) {
-        val newKind = if (mainFxKind == kind) 0 else kind
-        if ((newKind == 2 || newKind == 3) && !isProNow) {
-            viewModel.setCurrentLayerFx(newKind)   // paywall; no state change
-            return
-        }
-        viewModel.setCurrentLayerFx(newKind)
-        mainFxKind = newKind
-        restyleMainFx()
-    }
-
-    /** Re-render the three main FX pills' active/inactive look from [mainFxKind]. */
-    private fun restyleMainFx() {
-        styleMainFxPill(flipPill, 1, Design.violet)
-        styleMainFxPill(octDownPill, 3, Design.cyan)
-        styleMainFxPill(octUpPill, 2, Design.amber)
-    }
-
-    private fun styleMainFxPill(pill: TextView, kind: Int, color: Int) {
-        val on = mainFxKind == kind
-        pill.setTextColor(if (on) Color.BLACK else color)
-        pill.background = if (on) Design.pill(this, color, color) else Design.glass(this, 14f)
-    }
+    // (fxPill / onMainFxTap / restyleMainFx / styleMainFxPill removed with the main
+    //  FX row — the LAYERS sheet builds its own per-layer pills and drives them
+    //  through viewModel.setLayerFx(index, kind), which names the target layer
+    //  explicitly instead of implying "the newest one".)
 
     // Reusable premium marker: a small amber crown with a soft glow. One source
     // for every Pro-gated affordance so the signal reads identically everywhere.
@@ -1559,22 +1805,8 @@ class MainActivity : AppCompatActivity() {
             setOnTouchListener { v, e -> tapScale(v, e) { onClick(v) }; true }
         }
 
-    private fun stepButton(glyph: String, onClick: () -> Unit): View =
-        TextView(this).apply {
-            text = glyph; textSize = 24f; gravity = Gravity.CENTER
-            setTextColor(Design.textHi)
-            background = GradientDrawable().apply {
-                shape = GradientDrawable.OVAL; setColor(Design.surfaceHi)
-                setStroke(dp(1), Design.stroke)
-            }
-            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
-            setOnTouchListener { v, e ->
-                tapScale(v, e) {
-                    onClick(); v.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
-                }
-                true
-            }
-        }
+    // (stepButton removed with the BPM ±: the weighted slider covers coarse moves
+    //  and the tap-to-type overlay covers exact ones — no other caller existed.)
 
     private inline fun tapScale(v: View, e: MotionEvent, crossinline onUp: () -> Unit) {
         when (e.action) {
@@ -1588,17 +1820,18 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(v: Int) = Design.dp(v, this)
 
-    // Lightweight, framework (no androidx dep) transition for the bottom control
-    // rows. Scoped to bottomCol ONLY — never a scene root containing the hero,
-    // whose 60fps self-invalidation would thrash a scene capture.
-    private val controlTransition by lazy {
-        android.transition.AutoTransition().apply { duration = 200 }
-    }
-    private fun beginControlTransition() =
-        android.transition.TransitionManager.beginDelayedTransition(bottomCol, controlTransition)
+    // (AutoTransition is gone from the bottom rows. It ran fade→bounds→fade
+    //  SEQUENTIALLY — 3× the set's duration, so a disappearing card outlived the
+    //  hero morph and covered the circle — and its ChangeBounds resized views
+    //  without re-measuring, which clipped TextView labels mid-flight. Every row
+    //  now fades through setRowShown, where the ordering against the morph is
+    //  explicit and the layout stays real. See also animateLayersButton.)
 
-    // BPM ⇄ slider mapping (40–300 BPM over the 0..1 travel)
-    private fun bpmFromSlider(v: Float) = 40f + v * 260f
+    // BPM ⇄ slider mapping (40–300 BPM over the 0..1 travel). Rounded to whole BPM:
+    // 1 BPM is sub-pixel on this fader so finer resolution is unreachable anyway,
+    // and rounding guarantees the 120 detent yields exactly 120.0 — float drift
+    // could otherwise land on 119.99999, which the truncating readout shows as 119.
+    private fun bpmFromSlider(v: Float) = Math.round(40f + v * 260f).toFloat()
     private fun sliderFromBpm(bpm: Float) = ((bpm - 40f) / 260f).coerceIn(0f, 1f)
 
     // ---------------------------------------------------------------------

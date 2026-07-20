@@ -36,6 +36,20 @@ class SliderView(context: Context) : View(context) {
     var freeMarker: Float = -1f
         set(v) { field = v; invalidate() }
 
+    /** Neutral reference landmark as a fraction 0..1 (<0 = off) — e.g. 120 BPM on
+     *  the tempo fader. Unlike [freeMarker] it shades nothing and gates nothing:
+     *  it's purely a "you are here" tick, plus a detent haptic on crossing so the
+     *  value is findable by feel as well as by eye. */
+    var detent: Float = -1f
+        set(v) { field = v; invalidate() }
+
+    /** Half-width of the magnetic catch around [detent], in the same 0..1 units
+     *  (0 = no magnet, just the tick). Anything inside the window resolves to the
+     *  detent EXACTLY, which is the only way to reliably hit a reference value on
+     *  a fader whose full range is compressed into a couple of hundred dp. Keep it
+     *  narrow: it should swallow only values the finger couldn't target anyway. */
+    var detentSnap: Float = 0f
+
     /** Smoothly ease to a value (e.g. snap-back to the free limit) without firing
      *  onChange or detent haptics — used by the host after the paywall is dismissed. */
     fun animateTo(target: Float) {
@@ -50,6 +64,8 @@ class SliderView(context: Context) : View(context) {
 
     private var snapAnim: android.animation.ValueAnimator? = null
     private var lastMarkerSide = 0   // -1 below / +1 above the marker (detent edge-detect)
+    private var lastDetentSide = 0   // same edge-detect for the neutral landmark
+    private var wasSnapped = false   // inside the magnetic window last frame?
 
     private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; strokeCap = Paint.Cap.ROUND; color = Design.strokeSoft
@@ -111,6 +127,16 @@ class SliderView(context: Context) : View(context) {
             c.drawLine(markerX, cy - half, markerX, cy + half, markerPaint)
         }
 
+        // neutral reference landmark — also above the fill, so it stays readable
+        // whether the value sits below or above it.
+        if (detent in 0f..1f) {
+            val detentX = left + span * detent
+            markerPaint.color = Design.alpha(Design.textHi, 0.5f)
+            markerPaint.strokeWidth = Design.dpf(2f, context)
+            val half = Design.dpf(9f, context)   // taller than the track: reads as a landmark
+            c.drawLine(detentX, cy - half, detentX, cy + half, markerPaint)
+        }
+
         // thumb — glass body with an accent rim
         val thumbR = Design.dpf(10f, context)
         thumbPaint.shader = RadialGradient(
@@ -130,6 +156,8 @@ class SliderView(context: Context) : View(context) {
             MotionEvent.ACTION_DOWN -> {
                 snapAnim?.cancel()                 // user grabbed it mid snap-back
                 lastMarkerSide = 0                 // re-arm detect for this gesture
+                lastDetentSide = 0
+                wasSnapped = false                 // tapping straight into the notch should confirm
                 parent?.requestDisallowInterceptTouchEvent(true)
                 updateFromX(e.x)
                 return true
@@ -151,7 +179,14 @@ class SliderView(context: Context) : View(context) {
         val left = inset()
         val span = (width - inset()) - left
         if (span <= 0f) return
-        value = ((x - left) / span).coerceIn(0f, 1f)
+        val raw = ((x - left) / span).coerceIn(0f, 1f)
+        // Magnetic catch: inside the window the value resolves EXACTLY to the
+        // detent, so the reference tempo is reachable by drag at all. The window is
+        // sized by the caller to cover only what the finger can't target anyway,
+        // and exact off-detent values remain available via tap-to-type entry.
+        val snapped = detent in 0f..1f && detentSnap > 0f &&
+                      kotlin.math.abs(raw - detent) <= detentSnap
+        value = if (snapped) detent else raw
 
         val step = (value * 20).roundToInt()
         if (step != lastHapticStep) {
@@ -166,6 +201,24 @@ class SliderView(context: Context) : View(context) {
                 performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
             }
             lastMarkerSide = side
+        }
+        // Landmark detent (e.g. 120 BPM), findable without watching the readout.
+        // With a magnet we buzz on CATCH and on RELEASE — the physical feel of a
+        // notch, and the catch buzz is what tells you you've landed on it. Without
+        // one, we buzz on crossing instead.
+        if (detent in 0f..1f) {
+            if (detentSnap > 0f) {
+                if (snapped != wasSnapped) {
+                    wasSnapped = snapped
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                }
+            } else {
+                val side = if (value > detent) 1 else -1
+                if (lastDetentSide != 0 && side != lastDetentSide) {
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                }
+                lastDetentSide = side
+            }
         }
         onChange?.invoke(value)
         invalidate()
