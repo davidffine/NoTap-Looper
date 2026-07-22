@@ -281,6 +281,14 @@ float LooperEngine::get_loop_position() const {
     return static_cast<float>(current_idx) / static_cast<float>(buffer_size);
 }
 
+float LooperEngine::get_loop_seconds() const {
+    // אותה נעילה קצרה כמו get_loop_position: הווקטור עשוי להיות באמצע swap.
+    std::lock_guard<std::mutex> lock(buffer_mutex_);
+    size_t n = playback_buffers_[active_playback_idx_.load(std::memory_order_acquire)].size();
+    if (n == 0 || config_.sample_rate <= 0) return 0.0f;
+    return static_cast<float>(n) / static_cast<float>(config_.sample_rate);
+}
+
 void LooperEngine::update_hardware_config(int sample_rate, float latency_seconds) {
     // רישום בלבד — ה-Worker מחיל את השינוי בבטחה בתחילת האיטרציה שלו.
     // שינוי ישיר של config_ או resize של preroll_buffer_ מכאן הוא Data Race.
@@ -724,6 +732,20 @@ void LooperEngine::process_audio_asynchronously() {
     std::vector<float> mix_temp_;         // סקראץ' לרינדור לפני פרסום (מזעור זמן-נעילה)
     size_t overdub_idx = 0;
     bool overdub_publish_pending = false;
+    // אוברדאב מוצמד-לראש-הלופ: ממתין מרגע הנקישה עד העטיפה הבאה.
+    bool overdub_armed = false;
+    size_t armed_prev_play_idx = 0;   // לזיהוי העטיפה (ירידת ראש-הקריאה)
+
+    // ביטול-מחיקה בעומק 1 (Worker-owned). מוחזק בשלמותו כדי שהשחזור יחזיר את
+    // השכבה *כפי שהייתה* — כולל fx/gain/reverb/clean, לא רק את האודיו.
+    Layer undo_layer_;
+    int   undo_layer_index_ = -1;
+
+    // ספירה-לתוך (SYNC): דגימות שנותרו עד פתיחת ההקלטה.
+    size_t count_in_remaining = 0;
+
+    // ווטואים רצופים על תוכן-מזערי — מונה הריפוי-העצמי (ראה PROCESSING).
+    int consecutive_vetoes = 0;
 
     // --- פרסום חלק (נטול-קליק) בשני שלבים לעריכות שכבה שומרות-אורך ---
     // מחיקה/אפקט/עוצמה מחליפים את המיקס בבת-אחת; בלי טיפול, בנקודת הקריאה נוצרת
@@ -734,11 +756,18 @@ void LooperEngine::process_audio_asynchronously() {
     std::vector<float> pure_mix_pending;  // מטען שלב-2 (המיקס הטהור); ריק = אין ממתין
     int pure_publish_countdown = 0;       // צ'אנקים עד שלב 2
 
+    // מסכת ההאזנה שהוחלה בפועל (Worker-owned). כל מרנדר מדלג על שכבה ממוסכת,
+    // בלי לגעת ב-gain שלה — ה-gain נשאר של המשתמש בכל רגע.
+    uint32_t active_mask = 0;
+    int last_mirrored_layer_count = -1;
+    auto masked = [&](int k) { return (active_mask >> k) & 1u; };
+
     // סכום גולמי (ללא ברך) של כל השכבות המקובעות → committed_mix_ (בסיס מוניטור אוברדאב).
     auto render_committed_raw = [&]() {
         committed_mix_.assign(loop_length_, 0.0f);
-        for (const Layer& L : layers_) {
-            if (L.gain == 0.0f || L.samples.size() != loop_length_) continue;
+        for (int k = 0; k < static_cast<int>(layers_.size()); ++k) {
+            const Layer& L = layers_[k];
+            if (masked(k) || L.gain == 0.0f || L.samples.size() != loop_length_) continue;
             for (size_t i = 0; i < loop_length_; ++i) committed_mix_[i] += L.samples[i] * L.gain;
         }
     };
@@ -755,7 +784,7 @@ void LooperEngine::process_audio_asynchronously() {
     auto render_full_mix_excluding = [&](int exclude, std::vector<float>& dst) {
         dst.assign(loop_length_, 0.0f);
         for (int k = 0; k < static_cast<int>(layers_.size()); ++k) {
-            if (k == exclude) continue;
+            if (k == exclude || masked(k)) continue;
             const Layer& L = layers_[k];
             if (L.gain == 0.0f || L.samples.size() != loop_length_) continue;
             for (size_t i = 0; i < loop_length_; ++i) dst[i] += L.samples[i] * L.gain;
@@ -798,6 +827,14 @@ void LooperEngine::process_audio_asynchronously() {
     // מראה-מצב לכל השכבות (ספירה + fx/gain/reverb/clean) לקריאת ה-UI דרך JNI.
     auto sync_layer_mirror = [&]() {
         int n = static_cast<int>(layers_.size());
+        // כל שינוי במספר השכבות מזיז אינדקסים (מחיקה/ביטול-מחיקה/אוברדאב חדש),
+        // ומסכת האזנה מיושנת הייתה משתיקה פתאום את השכבה הלא-נכונה. איפוס על
+        // *כל* שינוי-ספירה הוא הכלל הפשוט והבטוח היחיד.
+        if (n != last_mirrored_layer_count) {
+            last_mirrored_layer_count = n;
+            active_mask = 0;
+            layer_mute_mask_.store(0, std::memory_order_relaxed);
+        }
         int denoised = 0;
         for (int i = 0; i < n && i < kMaxLayers; ++i) {
             layer_fx_[i].store(layers_[i].fx, std::memory_order_relaxed);
@@ -901,9 +938,39 @@ void LooperEngine::process_audio_asynchronously() {
     // איפוס טרנספורט: חובה בכל אירוע שמוליד לופ *חדש* (בסיס חדש/Import/Session)
     // או מוחק את הקיים. בלעדיו, משתמש שעצר לופ ואז ניקה והקליט מחדש היה מקבל
     // לופ חדש שנולד אילם — והכפתור היחיד שמסביר זאת כבר לא על המסך.
+    // מיקס מלא של השכבות הנוכחיות *בתוספת* שכבה נתונה — לפרסום ביטול-מחיקה
+    // בלי לגעת ב-layers_ לפני שהפרסום הצליח (אותו חוזה כמו מסלול המחיקה).
+    auto render_full_mix_including = [&](const Layer& extra, std::vector<float>& dst) {
+        dst.assign(loop_length_, 0.0f);
+        for (int k = 0; k < static_cast<int>(layers_.size()); ++k) {
+            const Layer& L = layers_[k];
+            if (masked(k) || L.gain == 0.0f || L.samples.size() != loop_length_) continue;
+            for (size_t i = 0; i < loop_length_; ++i) dst[i] += L.samples[i] * L.gain;
+        }
+        if (extra.gain != 0.0f && extra.samples.size() == loop_length_)
+            for (size_t i = 0; i < loop_length_; ++i) dst[i] += extra.samples[i] * extra.gain;
+        for (size_t i = 0; i < loop_length_; ++i) dst[i] = soft_clip_knee(dst[i]);
+    };
+
+    // ביטול-המחיקה שייך ללופ שממנו נמחקה השכבה. כל אירוע שמחליף את הלופ
+    // (clear/import/session/בסיס חדש) הופך אותו לחסר-משמעות — ומסוכן, כי האורך
+    // כבר לא תואם.
+    auto drop_undo = [&]() {
+        undo_layer_ = Layer{};
+        undo_layer_index_ = -1;
+        undo_available_.store(false, std::memory_order_relaxed);
+    };
+
     auto reset_transport = [&]() {
         transport_stopped_.store(false, std::memory_order_relaxed);
         output_muted_.store(false, std::memory_order_relaxed);
+        // בקשת שכבה ממתינה שייכת ללופ שממנו נולדה; לופ חדש/מחיקה מבטלים אותה,
+        // אחרת השכבה הייתה נכנסת מעצמה לתוך לופ אחר לגמרי.
+        overdub_armed = false;
+        overdub_armed_.store(false, std::memory_order_relaxed);
+        drop_undo();
+        count_in_remaining = 0;
+        count_in_beats_left_.store(0, std::memory_order_relaxed);
     };
 
     // פרסום נטול-קליק של mix_temp_ (שלב 1) עבור עריכות שומרות-אורך במצב LOOPING.
@@ -970,6 +1037,40 @@ void LooperEngine::process_audio_asynchronously() {
             std::cout << "[DSP] Dynamic Preroll calibrated to: "
                       << (static_cast<float>(max_preroll_samples) / config_.sample_rate)
                       << "s (hw " << config_.preroll_seconds << "s + decision window)." << std::endl;
+        }
+
+        // --- הצהרה בדיעבד על אורך הלופ בתיבות ---
+        // לא נוגע באודיו: הלופ הוא מה שהנגן ניגן. משתנים רק הקצב ומספר הפעימות,
+        // שמזינים את הקליק (נעול למיקום הלופ), את טיקי-הפעימה בטבעת ואת מצב
+        // SYNC. זו התשובה ל"למה אני חייב להקיש קצב *לפני* שניגנתי".
+        float req_bars = request_set_bars_.exchange(-1.0f, std::memory_order_relaxed);
+        if (req_bars > 0.0f && loop_length_ > 0) {
+            float beats = req_bars * 4.0f;
+            float secs = static_cast<float>(loop_length_) / static_cast<float>(config_.sample_rate);
+            loop_beats_.store(beats, std::memory_order_relaxed);
+            if (secs > 0.01f) {
+                float bpm = beats * 60.0f / secs;
+                estimated_bpm_.store(bpm, std::memory_order_relaxed);
+                target_bpm_.store(bpm, std::memory_order_relaxed);   // הקליק חייב להסכים
+                std::cout << "[DSP] Loop declared " << req_bars << " bars -> "
+                          << bpm << " BPM." << std::endl;
+            }
+        }
+
+        // --- כיול-מחדש ידני של רעש החדר ---
+        // חוקי רק כשאין אודיו בתעופה: ב-RECORDING היינו זורקים טייק חי, וב-LOOPING
+        // המעבר ל-CALIBRATING היה משתיק את ההשמעה (הקורא פעיל רק ב-LOOP/OVERDUB).
+        if (request_recalibrate_.exchange(false, std::memory_order_relaxed)) {
+            LooperState s_now = current_state_.load(std::memory_order_relaxed);
+            if (s_now == LooperState::IDLE || s_now == LooperState::CALIBRATING) {
+                noise_tracker_.reconfigure(config_.sample_rate, config_.chunk_size, 1.0f);
+                raw_noise_tracker_.reconfigure(config_.sample_rate, config_.chunk_size, 1.0f);
+                current_onset_streak_ = 0;
+                count_in_remaining = 0;   // the count belonged to the old room model
+                count_in_beats_left_.store(0, std::memory_order_relaxed);
+                current_state_.store(LooperState::CALIBRATING, std::memory_order_release);
+                std::cout << "[DSP] Re-learning the room on request." << std::endl;
+            }
         }
 
         // --- מסירת לופ מיובא (פוענח על JNI, מתפרסם רק כאן) ---
@@ -1169,6 +1270,48 @@ void LooperEngine::process_audio_asynchronously() {
 
                 int mode = detection_mode_.load(std::memory_order_relaxed);
 
+                // --- ספירה-לתוך (SYNC בלבד) ---
+                // הקליק כבר נשמע ב-IDLE במצב SYNC, ולכן הספירה היא רק חלון זמן
+                // שבסופו ההקלטה נפתחת מעצמה. יישור מדויק-לדגימה מיותר: PROCESSING
+                // גוזר את הראש ל-Onset האמיתי וממילא מצמיד לתיבות שלמות.
+                if (request_count_in_cancel_.exchange(false, std::memory_order_relaxed)) {
+                    count_in_remaining = 0;
+                    count_in_beats_left_.store(0, std::memory_order_relaxed);
+                }
+                if (request_count_in_.exchange(false, std::memory_order_relaxed)) {
+                    if (mode == 2) {
+                        float bpm_ci = target_bpm_.load(std::memory_order_relaxed);
+                        if (bpm_ci < 20.0f) bpm_ci = 120.0f;
+                        float beat_ci = (60.0f / bpm_ci) * config_.sample_rate;
+                        count_in_remaining = static_cast<size_t>(
+                            count_in_bars_.load(std::memory_order_relaxed) * 4.0f * beat_ci);
+                    }
+                }
+                bool count_in_fired = false;
+                // Leaving SYNC abandons the count: the click that gives it meaning
+                // only sounds in that mode, so it would become a silent wait.
+                if (count_in_remaining > 0 && mode != 2) {
+                    count_in_remaining = 0;
+                    count_in_beats_left_.store(0, std::memory_order_relaxed);
+                }
+                if (count_in_remaining > 0) {
+                    size_t step = local_chunk.size();
+                    count_in_remaining = (count_in_remaining > step) ? count_in_remaining - step : 0;
+                    float bpm_ci = target_bpm_.load(std::memory_order_relaxed);
+                    if (bpm_ci < 20.0f) bpm_ci = 120.0f;
+                    float beat_ci = (60.0f / bpm_ci) * config_.sample_rate;
+                    count_in_beats_left_.store(
+                        static_cast<int>(std::ceil(count_in_remaining / std::max(1.0f, beat_ci))),
+                        std::memory_order_relaxed);
+                    if (count_in_remaining == 0) count_in_fired = true;
+                }
+
+                // (כיול-מחדש אוטומטי מבוסס-חלון נבנה כאן ונמחק אחרי מדידה: הלמידה
+                //  ב-IDLE כבר רציפה — ראה הבלוק המשוער-רקע בסוף ה-case הזה — והיא
+                //  מטפלת בכיוון ה"חדר נעשה שקט" תוך ~2 שניות. הכיוון ההפוך אינו
+                //  ניתן לתיקון מ-IDLE כי רעש חדש פותח רצף ומוציא אותנו מ-IDLE
+                //  מיד. הריפוי לכיוון הזה יושב על הווטו ב-PROCESSING.)
+
                 // --- אלגוריתם היסטרזיס א-סימטרי מחמיר ---
 
                 if (current_onset_streak_ == 0) {
@@ -1211,7 +1354,10 @@ void LooperEngine::process_audio_asynchronously() {
 
                 // 2. קבלת החלטה
                 // המכונה תאשר הקלטה רק אם הרצף שרד את persistence החלונות במלואם.
-                bool auto_triggered = (mode != 1) && (current_onset_streak_ >= onset_persistence_target_.load(std::memory_order_relaxed));
+                // ספירה פעילה מקפיאה את הטריגר האקוסטי: הנגן אמור להיכנס *על*
+                // הפעימה, וצליל מוקדם היה מבטל את הספירה שהוא עצמו ביקש.
+                bool auto_triggered = (mode != 1) && (count_in_remaining == 0) &&
+                    (current_onset_streak_ >= onset_persistence_target_.load(std::memory_order_relaxed));
 
                 // שער המחזוריות: רצף שעבר את מבחני הרמה והמשך אך אינו מחזורי — רעש
                 // רחב-סרט מתמשך (קומפרסור/חבטה מהדהדת), לא מיתר. נמדד: הפרדת-רמה של
@@ -1227,15 +1373,23 @@ void LooperEngine::process_audio_asynchronously() {
 
                 bool manual_triggered = (mode == 1) && request_record_start_.exchange(false, std::memory_order_relaxed);
 
-                if (auto_triggered || manual_triggered) {
+                if (auto_triggered || manual_triggered || count_in_fired) {
                     current_onset_streak_ = 0;
-                    recorded_audio.clear();
+                    count_in_beats_left_.store(0, std::memory_order_relaxed);
+                        recorded_audio.clear();
 
                     // שאיבת הזמן האבוד: אנו מושכים את האודיו מה-Preroll, כך שכל 4 החלונות שעליהם התלבטנו
                     // (כולל הטרנזיינט הראשוני) מוכנסים במלואם להקלטה הסופית ללא קטיעות.
-                    for (size_t i = 0; i < max_preroll_samples; ++i) {
-                        size_t read_idx = (preroll_write_idx_ + i) % max_preroll_samples;
-                        recorded_audio.push_back(preroll_buffer_[read_idx]);
+                    //
+                    // ⚠ למעט אחרי ספירה-לתוך: אין שם התקף להציל (אנחנו פותחים על
+                    // הפעימה, לא בתגובה לצליל), וה-Preroll מכיל דווקא את *הקליק
+                    // האחרון* שדלף מהרמקול למיקרופון — טרנזיינט חד ש-find_true_onset
+                    // היה מזהה כתחילת הלופ, ומצמיד את הלולאה לקליק במקום לגיטרה.
+                    if (!count_in_fired) {
+                        for (size_t i = 0; i < max_preroll_samples; ++i) {
+                            size_t read_idx = (preroll_write_idx_ + i) % max_preroll_samples;
+                            recorded_audio.push_back(preroll_buffer_[read_idx]);
+                        }
                     }
 
                     peak_envelope = raw_volume;
@@ -1424,9 +1578,26 @@ void LooperEngine::process_audio_asynchronously() {
                               << (actual_playing_samples / config_.sample_rate)
                               << "s of musical content — non-musical transient, back to IDLE." << std::endl;
                     recorded_audio.clear();
+                    // ריפוי-עצמי לכיוון "החדר נעשה רועש". הלמידה ב-IDLE מוקפאת
+                    // בכל אנרגיה מעל חצי סף התהודה (הגנת בריחת-הרצפה), ולכן רעש
+                    // חדש *מעל* הסף לעולם לא נלמד — הוא רק מצית טייקים שהווטו
+                    // זורק, שוב ושוב. שני ווטואים רצופים הם ההוכחה שהמודל של
+                    // החדר שגוי (ולא סתם חבטה חד-פעמית), ואז לומדים אותו מחדש —
+                    // בדיוק ההיגיון של נטישת-הדרון, על מחלקת-כשל אחרת.
+                    if (++consecutive_vetoes >= 2) {
+                        consecutive_vetoes = 0;
+                        noise_tracker_.reconfigure(config_.sample_rate, config_.chunk_size, 1.0f);
+                        raw_noise_tracker_.reconfigure(config_.sample_rate, config_.chunk_size, 1.0f);
+                        current_onset_streak_ = 0;
+                        std::cout << "[DSP] Two vetoed takes in a row — re-learning the room."
+                                  << std::endl;
+                        current_state_.store(LooperState::CALIBRATING, std::memory_order_release);
+                        break;
+                    }
                     current_state_.store(LooperState::IDLE, std::memory_order_release);
                     break;
                 }
+                consecutive_vetoes = 0;   // טייק אמיתי ⇒ מודל החדר תקף
                 size_t ideal_length;
 
                 if (assembly_mode == 2) {
@@ -1553,12 +1724,41 @@ void LooperEngine::process_audio_asynchronously() {
                     render_full_mix_excluding(del, mix_temp_);
                     if (publish_mix_smoothed()) {
                         request_delete_layer_.store(-1, std::memory_order_relaxed);
+                        // שמירה לביטול *לפני* המחיקה — השכבה השלמה, לא רק האודיו,
+                        // כדי ששחזור יחזיר גם fx/gain/reverb/clean כפי שהיו.
+                        undo_layer_ = layers_[del];
+                        undo_layer_index_ = del;
+                        undo_available_.store(true, std::memory_order_relaxed);
                         layers_.erase(layers_.begin() + del);
                         sync_layer_mirror();
                     }
                     // slot תפוס: נשאיר את הבקשה, ננסה שוב בצ'אנק הבא (mix_temp_ מרונדר מחדש)
                 } else if (del >= 0) {
                     request_delete_layer_.store(-1, std::memory_order_relaxed);  // 0=בסיס / מחוץ-לטווח → התעלם
+                }
+
+                // --- ביטול המחיקה האחרונה ---
+                // אותו חוזה כמו המחיקה: מרנדרים את היעד, ורק אם הפרסום הצליח
+                // נוגעים ב-layers_. הפרסום החלק מוחק את מדרגת-התוכן, כך שהחזרת
+                // שכבה באמצע צליל אינה נשמעת כקליק.
+                if (request_undo_delete_.load(std::memory_order_relaxed)) {
+                    bool ok = undo_layer_index_ >= 1 && loop_length_ > 0 &&
+                              undo_layer_.samples.size() == loop_length_ &&
+                              static_cast<int>(layers_.size()) < kMaxLayers;
+                    if (ok) {
+                        render_full_mix_including(undo_layer_, mix_temp_);
+                        if (publish_mix_smoothed()) {
+                            int at = std::min<int>(undo_layer_index_, static_cast<int>(layers_.size()));
+                            layers_.insert(layers_.begin() + at, std::move(undo_layer_));
+                            request_undo_delete_.store(false, std::memory_order_relaxed);
+                            drop_undo();
+                            sync_layer_mirror();
+                            std::cout << "[DSP] Layer restored at " << at << "." << std::endl;
+                        }
+                        // slot תפוס: נשארים בבקשה, ננסה שוב בצ'אנק הבא
+                    } else {
+                        request_undo_delete_.store(false, std::memory_order_relaxed);
+                    }
                 }
 
                 // --- אפקטים פר-שכבה (פייז 3, Pro): fx / gain / reverb ---
@@ -1606,6 +1806,17 @@ void LooperEngine::process_audio_asynchronously() {
                     req_layer_reverb_idx_.store(-1, std::memory_order_relaxed);
                 }
 
+                // --- מסכת האזנה (Solo/Mute) ---
+                // אימוץ המסכה החדשה מותנה בהצלחת הפרסום: אחרת המרנדרים היו
+                // ממשיכים לעבוד לפי מסכה שמעולם לא נשמעה.
+                uint32_t want_mask = layer_mute_mask_.load(std::memory_order_acquire);
+                if (want_mask != active_mask) {
+                    uint32_t prev_mask = active_mask;
+                    active_mask = want_mask;
+                    render_full_mix_excluding(-1, mix_temp_);
+                    if (!publish_mix_smoothed()) active_mask = prev_mask;   // ננסה שוב
+                }
+
                 // gain: חי וזול (מוחל במיקס בלבד — אין רינדור-שכבה). מפורסם חלק —
                 // גרירה שולחת מדרגות בדידות; המיזוג הופך אותן לרציפות (אנטי-Zipper).
                 int lg_idx = req_layer_gain_idx_.load(std::memory_order_acquire);
@@ -1639,31 +1850,74 @@ void LooperEngine::process_audio_asynchronously() {
                     req_denoise_all_.store(-1, std::memory_order_relaxed);
                 }
 
+                // כניסה לאוברדאב: מקפיאים את סכום השכבות הקיימות (committed_mix_)
+                // ופותחים שכבה *חדשה* ריקה. המוניטור = committed_mix_ + new_layer_,
+                // מתפרסם בכל השלמת סיבוב. כלום לא נכתב לחוצץ שהרמקול קורא ממנו.
+                auto enter_overdub = [&]() {
+                    render_committed_raw();
+                    new_layer_.assign(loop_length_, 0.0f);
+                    // מיקס-ממתין (שלב 2) מתייתר: מוניטור האוברדאב יפרסם מיקסים
+                    // מצטברים חדשים ממילא, ופרסום ה"טהור" הישן היה דורס אותם.
+                    cancel_pending_pure();
+                    // --- פיצוי לייטנסי הלוך-ושוב ---
+                    // הדגימה שמגיעה מהמיקרופון "עכשיו" נוגנה על-ידי המשתמש כנגד
+                    // מה ששמע לפני (לייטנסי-פלט + לייטנסי-קלט). בלי הפיצוי כל
+                    // אוברדאב נכתב באיחור סיסטמטי של ~15-40ms — "פלאם" שמעי מול
+                    // הבסיס. ההיסט קבוע לכל משך האוברדאב ⇒ עיגון-כניסה מספיק.
+                    // (שיארית זמן-התור של ה-Worker ~0-1 צ'אנק נותרת — ג'יטר קטן
+                    // שאין לו מדידה זולה; הפיצוי מסיר את הרכיב הדטרמיניסטי.)
+                    // הנוסחה זהה בכניסה מיידית ובכניסה מוצמדת: היא נגזרת מהראש-קריאה
+                    // *ברגע הכניסה*, ולכן ההצמדה אינה משנה בה דבר.
+                    size_t comp = static_cast<size_t>(
+                        std::max(0, overdub_comp_samples_.load(std::memory_order_relaxed))) % loop_length_;
+                    overdub_idx = (playback_read_idx_.load(std::memory_order_relaxed) % loop_length_
+                                   + loop_length_ - comp) % loop_length_;
+                    overdub_publish_pending = false;
+                    current_state_.store(LooperState::OVERDUBBING, std::memory_order_release);
+                };
+
                 if (request_overdub_.exchange(false, std::memory_order_relaxed)) {
-                    // כניסה לאוברדאב: מקפיאים את סכום השכבות הקיימות (committed_mix_)
-                    // ופותחים שכבה *חדשה* ריקה. המוניטור = committed_mix_ + new_layer_,
-                    // מתפרסם בכל השלמת סיבוב. כלום לא נכתב לחוצץ שהרמקול קורא ממנו.
-                    // חסום בתקרת השכבות — הבייק בקומיט מובטח מקום.
-                    if (loop_length_ > 0 && !layers_.empty() &&
-                        static_cast<int>(layers_.size()) < kMaxLayers) {
-                        render_committed_raw();
-                        new_layer_.assign(loop_length_, 0.0f);
-                        // מיקס-ממתין (שלב 2) מתייתר: מוניטור האוברדאב יפרסם מיקסים
-                        // מצטברים חדשים ממילא, ופרסום ה"טהור" הישן היה דורס אותם.
-                        cancel_pending_pure();
-                        // --- פיצוי לייטנסי הלוך-ושוב ---
-                        // הדגימה שמגיעה מהמיקרופון "עכשיו" נוגנה על-ידי המשתמש כנגד
-                        // מה ששמע לפני (לייטנסי-פלט + לייטנסי-קלט). בלי הפיצוי כל
-                        // אוברדאב נכתב באיחור סיסטמטי של ~15-40ms — "פלאם" שמעי מול
-                        // הבסיס. ההיסט קבוע לכל משך האוברדאב ⇒ עיגון-כניסה מספיק.
-                        // (שיארית זמן-התור של ה-Worker ~0-1 צ'אנק נותרת — ג'יטר קטן
-                        // שאין לו מדידה זולה; הפיצוי מסיר את הרכיב הדטרמיניסטי.)
-                        size_t comp = static_cast<size_t>(
-                            std::max(0, overdub_comp_samples_.load(std::memory_order_relaxed))) % loop_length_;
-                        overdub_idx = (playback_read_idx_.load(std::memory_order_relaxed) % loop_length_
-                                       + loop_length_ - comp) % loop_length_;
-                        overdub_publish_pending = false;
-                        current_state_.store(LooperState::OVERDUBBING, std::memory_order_release);
+                    if (overdub_armed) {
+                        // נגיעה שנייה בזמן המתנה = ביטול. בלי זה המשתמש "לכוד"
+                        // עד ראש הלופ הבא ללא דרך לחזור בו.
+                        overdub_armed = false;
+                        overdub_armed_.store(false, std::memory_order_relaxed);
+                        std::cout << "[DSP] Armed overdub cancelled." << std::endl;
+                    } else if (loop_length_ > 0 && !layers_.empty() &&
+                               static_cast<int>(layers_.size()) < kMaxLayers) {
+                        if (overdub_quantize_.load(std::memory_order_relaxed)) {
+                            overdub_armed = true;
+                            overdub_armed_.store(true, std::memory_order_relaxed);
+                            armed_prev_play_idx = playback_read_idx_.load(std::memory_order_relaxed) % loop_length_;
+                        } else {
+                            enter_overdub();
+                        }
+                    }
+                }
+
+                // המתנה לראש הלופ: העטיפה מזוהה מירידת ראש-הקריאה. גרעיניות
+                // הצ'אנק (~11ms) אינה פוגעת ביישור — enter_overdub עוגן בראש-הקריאה
+                // האמיתי של רגע הכניסה, לא בהנחה שהוא אפס.
+                // מוניטור שהושתק/נעצר מבטל שכבה ממתינה. קריטי ולא קוסמטי: בעצירה
+                // ראש-הקריאה *מוצמד לאפס* ע"י קולבק הפלט, ומבחן העטיפה
+                // (now < prev) היה נדלק מיד — האוברדאב היה נכנס דווקא כשאין מה
+                // לשמוע, ומקליט את הנגן מול שקט. אותו היגיון להשתקה.
+                if (overdub_armed &&
+                    (transport_stopped_.load(std::memory_order_relaxed) ||
+                     output_muted_.load(std::memory_order_relaxed))) {
+                    overdub_armed = false;
+                    overdub_armed_.store(false, std::memory_order_relaxed);
+                    std::cout << "[DSP] Armed overdub cancelled (monitor silent)." << std::endl;
+                }
+
+                if (overdub_armed && loop_length_ > 0) {
+                    size_t now_idx = playback_read_idx_.load(std::memory_order_relaxed) % loop_length_;
+                    if (now_idx < armed_prev_play_idx) {
+                        overdub_armed = false;
+                        overdub_armed_.store(false, std::memory_order_relaxed);
+                        enter_overdub();
+                    } else {
+                        armed_prev_play_idx = now_idx;
                     }
                 }
                 break;

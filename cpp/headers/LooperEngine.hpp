@@ -204,6 +204,39 @@ private:
     std::atomic<int> request_delete_layer_{-1};
     std::atomic<int> layer_count_{0};       // מראה לקריאת ה-UI (0 = אין לופ)
 
+    // ביטול מחיקה (עומק 1). המחיקה הייתה בלתי-הפיכה *ובלתי-נשמעת מראש*: אין
+    // דרך לדעת איזו שכבה היא "אוברדאב 2" לפני שמוחקים אותה. השכבה האחרונה
+    // שנמחקה נשמרת בשלמותה (dry+samples+פרמטרים) עד לאירוע שמייתר אותה.
+    std::atomic<bool> request_undo_delete_{false};
+    std::atomic<bool> undo_available_{false};
+
+    // האזנה (Solo/Mute) כמסכת-ביטים — ביט פר-שכבה, 1 = מושתקת בהאזנה.
+    // ⚠ מדוע מסכה ולא set_layer_gain(i, 0) בלולאה: ערוץ ה-gain הוא תא-פקודה
+    // *יחיד* בסמנטיקת Last-Write-Wins (תקין לגרירת סליידר, קטלני לאצווה) —
+    // סולו על 4 שכבות היה משדר 4 פקודות שרק האחרונה שורדת עד שה-Worker קורא.
+    // מסכה היא כתיבה אטומית אחת, ובנוסף היא *אינה נוגעת ב-gain של המשתמש* כלל:
+    // אין מה לשמור ואין מה לשחזר, ולכן גם אין מרוץ-שחזור ואין אינדקסים מיושנים.
+    // ה-Worker מאפס אותה בכל שינוי במספר השכבות (מחיקה/ביטול/אוברדאב מזיזים
+    // אינדקסים, ומסכה מיושנת הייתה משתיקה את השכבה הלא-נכונה).
+    std::atomic<uint32_t> layer_mute_mask_{0};
+
+    // ספירה-לתוך (SYNC בלבד): המצב היחיד שבו הנגן התחייב לרשת — ובכל זאת
+    // ההקלטה נפתחה על הצליל הראשון, כלומר תמיד חצי פעימה באיחור.
+    std::atomic<bool>  request_count_in_{false};
+    std::atomic<bool>  request_count_in_cancel_{false};
+    std::atomic<float> count_in_bars_{2.0f};
+    std::atomic<int>   count_in_beats_left_{0};   // מראה ל-UI (0 = לא סופרים)
+
+    // הגדרת אורך הלופ בתיבות *בדיעבד*: הנגן מנגן חופשי ואז אומר "זה היה 8
+    // תיבות", והרשת נגזרת מהמוזיקה במקום להיקבע לפניה. אינו נוגע באודיו —
+    // רק בקצב ובמספר הפעימות (שמזינים את הקליק, הטיקים והסנכרון).
+    std::atomic<float> request_set_bars_{-1.0f};
+
+    // כיול-מחדש של רעש החדר. הסטטיסטיקה נלמדה פעם אחת ב-CALIBRATING ומעולם
+    // לא עודכנה: מאוורר/מזגן שנדלק *אחרי* העלייה משאיר את כל הרצפות היחסיות
+    // מכוילות לחדר שכבר לא קיים.
+    std::atomic<bool> request_recalibrate_{false};
+
     // --- אפקטים פר-שכבה (פייז 3, Pro) ---
     // ערוצי פקודה index+value (Last-Write-Wins; אובדן ערכי-ביניים בגרירת סליידר
     // הוא תקין). הכותב = JNI; ה-Worker צורך ומרנדר-מחדש את השכבה+המיקס. -1 = אין.
@@ -279,6 +312,16 @@ private:
     // בלעדיה כל שכבה עולה שתי נקישות (הצתה + נעילה) — וזה הורג את הבטחת
     // ה"בלי-מגע" מהשכבה השנייה והלאה. כבוי = התנהגות "צובר עד שתיגע" הישנה.
     std::atomic<bool> overdub_auto_close_{true};
+
+    // הצמדת *תחילת* האוברדאב לראש הלופ. יחד עם הסגירה-האוטומטית זה מוציא את
+    // תזמון הנקישה מהמשוואה לגמרי: השכבה היא בדיוק סיבוב אחד, מיושרת לתיבה,
+    // ולא משנה מתי בדיוק נגעת במסך. זה התיקון האמיתי ל"אני מאחר והשכבה מתחילה
+    // פעימה אחרי" — לא אפשר לזהות "כוונה" באמצע נגינה, אבל אפשר להפוך את רגע
+    // הנגיעה ללא-רלוונטי. כבוי = כניסה מיידית (ההתנהגות הישנה).
+    std::atomic<bool> overdub_quantize_{true};
+    // מראה ל-UI: הנגן ביקש שכבה והמנוע ממתין לראש הלופ. אינו מצב-מנוע (המצב
+    // נשאר LOOPING) — רק דגל תצוגה, כמו הטרנספורט.
+    std::atomic<bool> overdub_armed_{false};
 
     // התקדמות סגירת-הטייק (0..1) לחיווי ה-UI: המרבי מבין שני מסלולי הסגירה.
     // 1.0 = ההקלטה נסגרת עכשיו. אפס בכל מצב שאינו RECORDING-אוטומטי. הנגזרת
@@ -498,6 +541,38 @@ public:
 
     void set_overdub_auto_close(bool v) { overdub_auto_close_.store(v, std::memory_order_relaxed); }
     bool get_overdub_auto_close() const { return overdub_auto_close_.load(std::memory_order_relaxed); }
+    void set_overdub_quantize(bool v) { overdub_quantize_.store(v, std::memory_order_relaxed); }
+    bool is_overdub_armed() const { return overdub_armed_.load(std::memory_order_relaxed); }
+
+    /** ביטול המחיקה האחרונה (עומק 1). ה-Worker מבצע ומפרסם. */
+    void undo_delete_layer() { request_undo_delete_.store(true, std::memory_order_relaxed); }
+    bool is_undo_available() const { return undo_available_.load(std::memory_order_relaxed); }
+
+    /** מסכת האזנה: ביט פר-שכבה, 1 = מושתקת. 0 = המיקס האמיתי. */
+    void set_layer_mute_mask(uint32_t mask) {
+        layer_mute_mask_.store(mask, std::memory_order_release);
+    }
+    uint32_t get_layer_mute_mask() const {
+        return layer_mute_mask_.load(std::memory_order_relaxed);
+    }
+
+    /** ספירה-לתוך: bars תיבות של 4/4 בקצב היעד, ואז ההקלטה נפתחת מעצמה. */
+    void start_count_in() { request_count_in_.store(true, std::memory_order_relaxed); }
+    void cancel_count_in() { request_count_in_cancel_.store(true, std::memory_order_relaxed); }
+    void set_count_in_bars(float bars) {
+        count_in_bars_.store(std::clamp(bars, 1.0f, 8.0f), std::memory_order_relaxed);
+    }
+    int get_count_in_beats_left() const {
+        return count_in_beats_left_.load(std::memory_order_relaxed);
+    }
+
+    /** הצהרה בדיעבד על אורך הלופ בתיבות (4/4). לא נוגע באודיו. */
+    void set_loop_bars(float bars) {
+        if (bars > 0.0f) request_set_bars_.store(bars, std::memory_order_relaxed);
+    }
+
+    /** למידה מחדש של רעש החדר (חוקי מ-IDLE/CALIBRATING; מתעלם בזמן נגינה). */
+    void request_recalibrate() { request_recalibrate_.store(true, std::memory_order_relaxed); }
 
     // התקדמות סגירת הטייק (0..1) לחיווי; 0 כשלא רלוונטי.
     float get_closure_progress() const { return closure_progress_.load(std::memory_order_relaxed); }
@@ -507,6 +582,9 @@ public:
     float get_estimated_bpm() const;
     float get_loop_beats() const;
     float get_loop_position() const;
+    /** אורך הלופ בשניות (0 = אין לופ). נדרש כדי להצהיר על מספר תיבות בדיעבד
+     *  גם על לופ *מיובא*, שאין לו קצב או פעימות מאומדים כלל. */
+    float get_loop_seconds() const;
 
     bool export_to_wav(const char* filepath);
     bool import_from_wav(const char* filepath);
