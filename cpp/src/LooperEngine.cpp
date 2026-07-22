@@ -356,13 +356,44 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
     // חלה על *כל* היציאה כולל הקליק: זו עוצמת האפליקציה, ולולא כן הורדת הלופ
     // הייתה הופכת את המטרונום לדומיננטי. מוחלקת בחד-קוטבי (~15ms) כדי שגרירת
     // הסליידר לא תייצר מדרגות-גיין. כשהעוצמה מלאה והחלקתה התכנסה — אפס עבודה.
+    // --- דעיכת-סיום ---
+    // חייבת להיות מנוהלת כאן, ב-Thread של ה-Output: זהו המקום היחיד עם שעון
+    // מדויק-לדגימה, וכל ספירה שנעשית ב-UI הייתה מגמגמת עם כל קפיצת-פריים.
+    if (request_fade_cancel_.exchange(false, std::memory_order_relaxed)) {
+        fade_left_ = 0; fade_len_ = 0;
+        fade_active_.store(false, std::memory_order_relaxed);
+    }
+    if (request_fade_out_.exchange(false, std::memory_order_acquire)) {
+        const float sr_f = static_cast<float>(config_.sample_rate > 0 ? config_.sample_rate : 48000);
+        fade_len_ = std::max<int64_t>(1, static_cast<int64_t>(
+            fade_out_seconds_.load(std::memory_order_relaxed) * sr_f));
+        fade_left_ = fade_len_;
+        fade_active_.store(true, std::memory_order_relaxed);
+    }
+
     const float mv_target = master_volume_.load(std::memory_order_relaxed);
-    if (mv_target != 1.0f || master_volume_smoothed_ != 1.0f) {
+    const bool fading = fade_left_ > 0;
+    if (mv_target != 1.0f || master_volume_smoothed_ != 1.0f || fading) {
         const float sr = static_cast<float>(config_.sample_rate);
         const float a = 1.0f - std::exp(-1.0f / (0.015f * (sr > 0.0f ? sr : 48000.0f)));
         for (size_t i = 0; i < num_frames; ++i) {
             master_volume_smoothed_ += (mv_target - master_volume_smoothed_) * a;
-            output_data[i] *= master_volume_smoothed_;
+            float g = master_volume_smoothed_;
+            if (fade_left_ > 0) {
+                // ריבועי, לא לינארי: דעיכה לינארית באמפליטודה נשמעת כאילו
+                // "נגמרה" בערך באמצע ואז נגררת. הריבוע הוא ההיפוך המדויק של
+                // עקומת פאדר-העוצמה, כך ששתי הדעיכות נשמעות מאותה משפחה.
+                const float f = static_cast<float>(fade_left_) / static_cast<float>(fade_len_);
+                g *= f * f;
+                if (--fade_left_ == 0) {
+                    // הלופ *נשמר* — רק הטרנספורט נעצר, בדיוק כמו STOP ידני,
+                    // כך שהמשך אפשרי ואין שום דבר הרסני בסוף מוזיקלי.
+                    transport_stopped_.store(true, std::memory_order_relaxed);
+                    fade_active_.store(false, std::memory_order_relaxed);
+                    fade_len_ = 0;
+                }
+            }
+            output_data[i] *= g;
         }
         // קיבוע מדויק: החד-קוטבי מתקרב אסימפטוטית בלבד, והשארית הייתה מחזיקה
         // את המסלול היקר הזה דלוק לנצח אחרי חזרה ל-100%.
@@ -695,6 +726,9 @@ int LooperEngine::get_loop_waveform(float* out, int max_bins) {
     return max_bins;
 }
 
+// מוגדר למטה (ליד export_to_wav, שם הוא נולד); ה-Worker משתמש בו לייצוא סטמים.
+static bool write_wav_mono16(const char* filepath, const std::vector<float>& data, int sample_rate);
+
 void LooperEngine::process_audio_asynchronously() {
     // הגנת דנורמלים — חייבת לרוץ על ה-Thread הזה עצמו
     enable_denormal_flush_to_zero();
@@ -964,6 +998,7 @@ void LooperEngine::process_audio_asynchronously() {
     auto reset_transport = [&]() {
         transport_stopped_.store(false, std::memory_order_relaxed);
         output_muted_.store(false, std::memory_order_relaxed);
+        cancel_fade_out();   // a fade belongs to the loop it was ending
         // בקשת שכבה ממתינה שייכת ללופ שממנו נולדה; לופ חדש/מחיקה מבטלים אותה,
         // אחרת השכבה הייתה נכנסת מעצמה לתוך לופ אחר לגמרי.
         overdub_armed = false;
@@ -1100,6 +1135,31 @@ void LooperEngine::process_audio_asynchronously() {
                 std::cout << "[I/O] Imported loop injected to DSP." << std::endl;
             }
             // slot == -1: הקורא עוד לא נצפה — ננסה שוב באיטרציה הבאה
+        }
+
+        // --- ייצוא סטמים (בקשה מ-JNI; רק ה-Worker רואה את layers_) ---
+        // כל סטם = התרומה של השכבה למיקס: samples (fx+ריברב כבר צרובים) × gain.
+        // סכום הסטמים הוא הלופ, שזה בדיוק מה שמצפים ממי שייקח אותם ל-DAW.
+        // מסכת ההאזנה מכוונת *לא* משפיעה — היא מצב הקשבה זמני, לא עריכה.
+        if (request_export_stems_.exchange(false, std::memory_order_relaxed)) {
+            std::string prefix;
+            {
+                std::lock_guard<std::mutex> lock(buffer_mutex_);
+                prefix = pending_stems_prefix_;
+            }
+            int written = 0;
+            std::vector<float> stem;
+            for (size_t k = 0; k < layers_.size(); ++k) {
+                const Layer& L = layers_[k];
+                if (L.samples.size() != loop_length_ || loop_length_ == 0) continue;
+                stem.assign(loop_length_, 0.0f);
+                for (size_t i = 0; i < loop_length_; ++i)
+                    stem[i] = std::clamp(L.samples[i] * L.gain, -1.0f, 1.0f);
+                std::string path = prefix + std::to_string(k) + ".wav";
+                if (write_wav_mono16(path.c_str(), stem, config_.sample_rate)) ++written;
+            }
+            stems_result_.store(written > 0 ? written : -1, std::memory_order_release);
+            std::cout << "[I/O] Exported " << written << " stem(s)." << std::endl;
         }
 
         // --- שמירת סשן (בקשה מ-JNI; רק ה-Worker רואה את layers_) ---
@@ -2031,6 +2091,41 @@ size_t LooperEngine::feed_audio_offline(const float* data, size_t num_samples) {
     return accepted;
 }
 
+// כותב מונו-float כ-WAV PCM 16-bit. חולץ מ-export_to_wav כדי שייצוא הסטמים
+// (שרץ על ה-Worker) לא ישכפל את הלוגיקה — כולל בחירת ה-16-bit, שקיימת מסיבה
+// אמיתית: WAV IEEE-float אינו מזוהה תמיד כאודיו על-ידי סורק המדיה של אנדרואיד.
+static bool write_wav_mono16(const char* filepath, const std::vector<float>& data, int sample_rate) {
+    if (data.empty()) return false;
+    std::vector<ma_int16> pcm16(data.size());
+    ma_pcm_f32_to_s16(pcm16.data(), data.data(), data.size(), ma_dither_mode_triangle);
+    ma_encoder_config config =
+        ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, sample_rate);
+    ma_encoder encoder;
+    if (ma_encoder_init_file(filepath, &config, &encoder) != MA_SUCCESS) {
+        std::cerr << "[I/O Error] Failed to initialize WAV encoder for " << filepath << std::endl;
+        return false;
+    }
+    ma_encoder_write_pcm_frames(&encoder, pcm16.data(), pcm16.size(), nullptr);
+    ma_encoder_uninit(&encoder);
+    return true;
+}
+
+int LooperEngine::export_stems(const char* path_prefix) {
+    // אותה תבנית כמו save_session: רק ה-Worker רואה את layers_.
+    {
+        std::lock_guard<std::mutex> lock(buffer_mutex_);
+        pending_stems_prefix_ = path_prefix;
+    }
+    stems_result_.store(0, std::memory_order_relaxed);
+    request_export_stems_.store(true, std::memory_order_release);
+    for (int i = 0; i < 4000; ++i) {                       // עד ~4s (N קבצים)
+        int r = stems_result_.load(std::memory_order_acquire);
+        if (r != 0) return r > 0 ? r : 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return 0;
+}
+
 bool LooperEngine::export_to_wav(const char* filepath) {
     // צילום מצב תחת נעילה קצרה — ואז כתיבת הקובץ האיטית מחוץ לנעילה,
     // כדי שה-Worker לא יחליף/יכתוב את הווקטור באמצע ה-I/O
@@ -2054,21 +2149,7 @@ bool LooperEngine::export_to_wav(const char* filepath) {
     // אינו מזוהה תמיד כאודיו על-ידי סורק המדיה של אנדרואיד → הקובץ "נעלם" מבוררי
     // הקבצים המבוססי-MediaStore ולא ניתן לבחור אותו. 16-bit נתמך בכל מקום, חצי
     // גודל, וללא אובדן איכות נשמע לגיטרה.
-    std::vector<ma_int16> pcm16(snapshot.size());
-    ma_pcm_f32_to_s16(pcm16.data(), snapshot.data(), snapshot.size(), ma_dither_mode_triangle);
-
-    ma_encoder_config config = ma_encoder_config_init(ma_encoding_format_wav, ma_format_s16, 1, config_.sample_rate);
-    ma_encoder encoder;
-
-    if (ma_encoder_init_file(filepath, &config, &encoder) != MA_SUCCESS) {
-        std::cerr << "[I/O Error] Failed to initialize WAV encoder." << std::endl;
-        return false;
-    }
-
-    // שפיכת הזיכרון לקובץ
-    ma_encoder_write_pcm_frames(&encoder, pcm16.data(), pcm16.size(), nullptr);
-    ma_encoder_uninit(&encoder);
-
+    if (!write_wav_mono16(filepath, snapshot, config_.sample_rate)) return false;
     std::cout << "[I/O] Successfully exported loop to: " << filepath << std::endl;
     return true;
 }

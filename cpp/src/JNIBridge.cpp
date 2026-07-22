@@ -39,16 +39,17 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_executeRecordStop(JNIEn
 //   [5]=loop_beats · [6]=loop_pos(0..1) · [7]=layer_count · [8]=denoised_count ·
 //   [9]=transport_stopped(0/1) · [10]=output_muted(0/1) · [11]=closure_progress(0..1) ·
 //   [12]=overdub_armed(0/1) · [13]=undo_available(0/1) · [14]=count_in_beats_left ·
-//   [15]=layer_mute_mask (bitfield, exact in float32 up to 2^24) · [16]=loop_seconds
+//   [15]=layer_mute_mask (bitfield, exact in float32 up to 2^24) · [16]=loop_seconds ·
+//   [17]=fading_out(0/1)
 //
 // 9-11 הם *מראה* של מצב שה-UI עצמו כתב — ובכל זאת נקראים מהמנוע ולא נזכרים
 // ב-Kotlin: ה-Worker מאפס טרנספורט בכל לופ חדש (clear/import/session/בסיס),
 // וזיכרון מקומי ב-UI היה נשאר תקוע על "עצור" מול מנוע שכבר מנגן.
 JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *env, jobject thiz, jfloatArray outData) {
     if (!g_engine || outData == nullptr) return;
-    if (env->GetArrayLength(outData) < 17) return;
+    if (env->GetArrayLength(outData) < 18) return;
 
-    jfloat telemetry[17];
+    jfloat telemetry[18];
     telemetry[0] = g_engine->current_rms_.load(std::memory_order_relaxed);
     telemetry[1] = g_engine->current_noise_std_dev_.load(std::memory_order_relaxed);
     // קריאה ואיפוס אטומי של דגל הטרנזיינט
@@ -67,9 +68,31 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *e
     telemetry[14] = static_cast<jfloat>(g_engine->get_count_in_beats_left());
     telemetry[15] = static_cast<jfloat>(g_engine->get_layer_mute_mask());
     telemetry[16] = g_engine->get_loop_seconds();
+    telemetry[17] = g_engine->is_fading_out() ? 1.0f : 0.0f;
 
     // כתיבה חזרה למערך של Kotlin ללא הקצאות זיכרון חדשות
-    env->SetFloatArrayRegion(outData, 0, 17, telemetry);
+    env->SetFloatArrayRegion(outData, 0, 18, telemetry);
+}
+
+// ייצוא סטמים: כותב "<prefix>N.wav" לכל שכבה; מחזיר כמה נכתבו (0 = כשל).
+JNIEXPORT jint JNICALL
+Java_com_notap_looper_AudioEngine_exportStems(JNIEnv *env, jobject thiz, jstring prefix) {
+    if (!g_engine) return 0;
+    const char *nativeString = env->GetStringUTFChars(prefix, 0);
+    int n = g_engine->export_stems(nativeString);
+    env->ReleaseStringUTFChars(prefix, nativeString);
+    return n;
+}
+
+// דעיכת-סיום: בסופה הטרנספורט נעצר והלופ נשמר.
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_startFadeOut(JNIEnv *env, jobject thiz, jfloat seconds) {
+    if (g_engine) g_engine->start_fade_out(seconds);
+}
+
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_cancelFadeOut(JNIEnv *env, jobject thiz) {
+    if (g_engine) g_engine->cancel_fade_out();
 }
 
 // מסכת האזנה (Solo/Mute) — כתיבה אטומית אחת לכל האצווה.

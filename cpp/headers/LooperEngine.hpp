@@ -304,6 +304,24 @@ private:
     // כי זו עוצמת *היציאה של האפליקציה*, לא של שכבה. אינה נוגעת ב-layers_,
     // ולכן ייצוא/סשן/הקלטת אוברדאב יוצאים ברמה מלאה תמיד.
     std::atomic<float> master_volume_{1.0f};
+
+    // --- סיום בדעיכה (Fade-out) ---
+    // הלופ נעצר עד היום *חד* — סיום שנשמע כקטיעה ולא כסוף. הדעיכה היא מחווה
+    // של נגינה, לא עריכה: היא חיה על נתיב הפלט בלבד ואינה נוגעת באודיו, ולכן
+    // הייצוא לא מושפע (דעיכה בתוך לופ הייתה נשמעת בכל סיבוב מחדש).
+    std::atomic<bool>  request_fade_out_{false};
+    std::atomic<bool>  request_fade_cancel_{false};
+    std::atomic<float> fade_out_seconds_{6.0f};
+    std::atomic<bool>  fade_active_{false};    // מראה ל-UI
+    int64_t fade_left_ = 0;                    // Thread של ה-Output בלבד
+    int64_t fade_len_  = 0;
+
+    // --- ייצוא סטמים (שכבה-שכבה) ---
+    // רק ה-Worker רואה את layers_, ולכן אותה תבנית כמו save_session: בקשה +
+    // המתנת-Poll לתוצאה. התוצאה היא מספר הקבצים שנכתבו (או -1).
+    std::string pending_stems_prefix_;         // מוגן על-ידי buffer_mutex_
+    std::atomic<bool> request_export_stems_{false};
+    std::atomic<int>  stems_result_{0};
     // מצב ההחלקה — Thread של ה-Output בלבד. בלי החלקה, גרירת סליידר ב-60fps
     // מייצרת מדרגת-גיין בכל גבול-קולבק ("זיפר") שנשמעת על צליל מוחזק.
     float master_volume_smoothed_{1.0f};
@@ -588,6 +606,19 @@ public:
 
     bool export_to_wav(const char* filepath);
     bool import_from_wav(const char* filepath);
+
+    /** ייצוא כל שכבה כקובץ נפרד: "<prefix>0.wav", "<prefix>1.wav"… כל סטם הוא
+     *  התרומה של אותה שכבה למיקס (fx/ריברב/עוצמה כלולים) — כך שסכום הסטמים
+     *  הוא הלופ. חוסם עד סיום הכתיבה; מחזיר את מספר הקבצים שנכתבו (0 = כשל). */
+    int export_stems(const char* path_prefix);
+
+    /** התחלת דעיכת-סיום; בסופה הטרנספורט נעצר מעצמו (הלופ נשמר). */
+    void start_fade_out(float seconds) {
+        fade_out_seconds_.store(std::clamp(seconds, 0.5f, 30.0f), std::memory_order_relaxed);
+        request_fade_out_.store(true, std::memory_order_release);
+    }
+    void cancel_fade_out() { request_fade_cancel_.store(true, std::memory_order_relaxed); }
+    bool is_fading_out() const { return fade_active_.load(std::memory_order_relaxed); }
 
     // סשן רב-מסלולי (NTSN v1): שמירה/טעינה של *כל* השכבות — dry + gain/fx/reverb —
     // כך ששחזור מחזיר את מבנה השכבות המלא (מחיקה/עריכה פר-שכבה שורדות ריסטארט),
