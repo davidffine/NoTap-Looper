@@ -302,6 +302,9 @@ void LooperEngine::on_audio_callback(const float* input_data, size_t num_frames)
 void LooperEngine::process_output_callback(float* output_data, size_t num_frames) {
     LooperState state = current_state_.load(std::memory_order_relaxed);
     bool playing = (state == LooperState::LOOPING || state == LooperState::OVERDUBBING);
+    // טרנספורט: שני דגלים בלבד על נתיב הפלט (ראה LooperEngine.hpp).
+    const bool stopped = transport_stopped_.load(std::memory_order_relaxed);
+    const bool muted   = output_muted_.load(std::memory_order_relaxed);
 
     size_t loop_pos = 0, loop_size = 0;   // ל-lock המטרונום בזמן נגינה
 
@@ -309,19 +312,25 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
         for (size_t i = 0; i < num_frames; ++i) output_data[i] = 0.0f;
     } else {
         int active_idx = active_playback_idx_.load(std::memory_order_acquire);
-        // איתות Grace: ה-Worker רשאי לכתוב לחוצץ הלא-פעיל רק אחרי שנצפינו כאן על הפעיל.
+        // איתות Grace: ה-Worker רשאי לכתוב לחוצץ הלא-פעיל רק אחרי שנצפינו כאן על
+        // הפעיל. חייב לרוץ *גם* בעצירה — אחרת הפרסום נחסם והמנוע קופא בזמן STOP.
         reader_observed_idx_.store(active_idx, std::memory_order_release);
         const auto& active_buffer = playback_buffers_[active_idx];
 
-        if (active_buffer.empty()) {
+        if (active_buffer.empty() || stopped) {
             for (size_t i = 0; i < num_frames; ++i) output_data[i] = 0.0f;
+            // חניית ראש-הקריאה בראש הלופ: ה-Output הוא הכותב היחיד של האינדקס,
+            // ולכן ה"ריווינד" חייב לקרות כאן ולא ב-Thread של ה-UI.
+            if (stopped) playback_read_idx_.store(0, std::memory_order_relaxed);
         } else {
             size_t buffer_size = active_buffer.size();
             size_t current_idx = playback_read_idx_.load(std::memory_order_relaxed);
             if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
             loop_pos = current_idx; loop_size = buffer_size;
             for (size_t i = 0; i < num_frames; ++i) {
-                output_data[i] = active_buffer[current_idx];
+                // MUTE משתיק את הפלט אך *ממשיך להתקדם* — הפאזה נשמרת, וההסרה
+                // מחזירה את המשתמש פנימה בדיוק בקצב (זו כל הנקודה מול STOP).
+                output_data[i] = muted ? 0.0f : active_buffer[current_idx];
                 current_idx++;
                 if (current_idx >= buffer_size) [[unlikely]] current_idx = 0;
             }
@@ -331,7 +340,27 @@ void LooperEngine::process_output_callback(float* output_data, size_t num_frames
 
     // (אין DSP נוסף על נתיב הפלט: הריברב פר-שכבה נצרב מראש לתוך המיקס על-ידי
     // ה-Worker. הקולבק קורא חוצץ מוכן ומוסיף מטרונום בלבד — מינימום עבודה ב-RT.)
-    render_metronome(output_data, num_frames, state, playing, loop_pos, loop_size);
+    // בעצירה playing=false ⇒ שער המטרונום סוגר מעצמו (עצירה = שקט מוחלט);
+    // בהשתקה הוא נשאר פתוח — הקליק הוא הרפרנס שמחזיר את הנגן בקצב.
+    render_metronome(output_data, num_frames, state, playing && !stopped, loop_pos, loop_size);
+
+    // --- עוצמת ניטור (Master), אחרונה בשרשרת ---
+    // חלה על *כל* היציאה כולל הקליק: זו עוצמת האפליקציה, ולולא כן הורדת הלופ
+    // הייתה הופכת את המטרונום לדומיננטי. מוחלקת בחד-קוטבי (~15ms) כדי שגרירת
+    // הסליידר לא תייצר מדרגות-גיין. כשהעוצמה מלאה והחלקתה התכנסה — אפס עבודה.
+    const float mv_target = master_volume_.load(std::memory_order_relaxed);
+    if (mv_target != 1.0f || master_volume_smoothed_ != 1.0f) {
+        const float sr = static_cast<float>(config_.sample_rate);
+        const float a = 1.0f - std::exp(-1.0f / (0.015f * (sr > 0.0f ? sr : 48000.0f)));
+        for (size_t i = 0; i < num_frames; ++i) {
+            master_volume_smoothed_ += (mv_target - master_volume_smoothed_) * a;
+            output_data[i] *= master_volume_smoothed_;
+        }
+        // קיבוע מדויק: החד-קוטבי מתקרב אסימפטוטית בלבד, והשארית הייתה מחזיקה
+        // את המסלול היקר הזה דלוק לנצח אחרי חזרה ל-100%.
+        if (std::abs(mv_target - master_volume_smoothed_) < 1e-4f)
+            master_volume_smoothed_ = mv_target;
+    }
 }
 
 // מטרונום/Count-in למצב SYNC. רץ על ה-Thread של ה-Output. בזמן נגינה גזור הקצב
@@ -869,6 +898,14 @@ void LooperEngine::process_audio_asynchronously() {
         pure_publish_countdown = 0;
     };
 
+    // איפוס טרנספורט: חובה בכל אירוע שמוליד לופ *חדש* (בסיס חדש/Import/Session)
+    // או מוחק את הקיים. בלעדיו, משתמש שעצר לופ ואז ניקה והקליט מחדש היה מקבל
+    // לופ חדש שנולד אילם — והכפתור היחיד שמסביר זאת כבר לא על המסך.
+    auto reset_transport = [&]() {
+        transport_stopped_.store(false, std::memory_order_relaxed);
+        output_muted_.store(false, std::memory_order_relaxed);
+    };
+
     // פרסום נטול-קליק של mix_temp_ (שלב 1) עבור עריכות שומרות-אורך במצב LOOPING.
     //   [rd, rd+MARGIN):        תוכן ישן — הקורא יימצא כאן ברגע ההחלפה (מדרגה=0)
     //   [rd+MARGIN, +FADE):     מיזוג קוסינוס ישן→חדש (אפס-נגזרת בקצוות)
@@ -957,6 +994,7 @@ void LooperEngine::process_audio_asynchronously() {
                 has_pending_import_.store(false, std::memory_order_release);
                 playback_read_idx_.store(0, std::memory_order_relaxed);
                 active_playback_idx_.store(slot, std::memory_order_release);
+                reset_transport();
                 current_state_.store(LooperState::LOOPING, std::memory_order_release);
                 std::cout << "[I/O] Imported loop injected to DSP." << std::endl;
             }
@@ -1027,6 +1065,7 @@ void LooperEngine::process_audio_asynchronously() {
                     active_playback_idx_.store(slot, std::memory_order_release);
                     estimated_bpm_.store(sess_bpm, std::memory_order_relaxed);
                     loop_beats_.store(sess_beats, std::memory_order_relaxed);
+                    reset_transport();
                     current_state_.store(LooperState::LOOPING, std::memory_order_release);
                     std::cout << "[I/O] Session restored (" << layers_.size() << " layers)." << std::endl;
                 } else if (started) {
@@ -1044,6 +1083,7 @@ void LooperEngine::process_audio_asynchronously() {
         }
 
         if (request_clear_.exchange(false, std::memory_order_relaxed)) {
+            reset_transport();
             recorded_audio.clear();
             layers_.clear();
             loop_length_ = 0;
@@ -1103,6 +1143,11 @@ void LooperEngine::process_audio_asynchronously() {
         current_noise_std_dev_.store(noise_tracker_.get_std_dev(), std::memory_order_relaxed);
 
         LooperState state = current_state_.load(std::memory_order_relaxed);
+
+        // חיווי הסגירה חי רק בזמן הקלטה אוטומטית. בכל מצב אחר הוא חייב להתאפס,
+        // אחרת טבעת הספירה-לאחור נשארת תקועה על המסך אחרי שהלופ כבר פורסם.
+        if (state != LooperState::RECORDING)
+            closure_progress_.store(0.0f, std::memory_order_relaxed);
 
         switch (state) {
             case LooperState::CALIBRATING: {
@@ -1231,6 +1276,7 @@ void LooperEngine::process_audio_asynchronously() {
 
                 if (mode == 1) {
                     // מצב Tap & Trim — הנגן קבע את הסוף בעצמו; אין זנב לא-מוזיקלי
+                    closure_progress_.store(0.0f, std::memory_order_relaxed);   // אין ספירה-לאחור ידנית
                     if (request_record_stop_.exchange(false, std::memory_order_relaxed)) {
                         trailing_non_musical_samples = 0;
                         current_state_.store(LooperState::PROCESSING, std::memory_order_release);
@@ -1251,6 +1297,29 @@ void LooperEngine::process_audio_asynchronously() {
                     float sil_floor = std::max({raw_noise_tracker_.get_silence_threshold(),
                                                 raw_noise_tracker_.get_mean() * silence_rel_mult_.load(std::memory_order_relaxed),
                                                 silence_abs_floor_.load(std::memory_order_relaxed)});
+                    // תקרה יחסית-לשיא: הרצפה היחסית-לרעש מכוילת לחדר-הייחוס, ובחדר
+                    // רועש (mean גבוה) היא מטפסת אל *תוך* טווח הנגינה — ואז פסאז'
+                    // פיאניסימו נספר כשקט וההקלטה נסגרת באמצע ביטוי. חוסמים אותה
+                    // מתחת לרצפת-הפעילות (0.15 מהשיא) כדי שסדר שני המסלולים יישמר:
+                    // "שקט" חייב להיות שקט יותר מ"חוסר-פעילות", לא להתלכד איתו.
+                    //
+                    // ⚠ תנאי-השער אינו קוסמטי — נמדד: בלעדיו הקורפוס השלילי נשבר
+                    // (ac_silence/silence2 מפרסמים לופ בכל נקודת מטריצה). הסיבה:
+                    // בטייק שהוצת מרעש, session_peak *הוא* הרעש, התקרה צונחת מתחת
+                    // לרמת הרעש, מסלול-השקט לעולם לא נסגר, והסגירה האיטית משאירה
+                    // מספיק "תוכן" כדי לעקוף את וטו התוכן-המזערי. לכן מרפים את
+                    // הרצפה רק כשהטייק *מוכח* כנגינה: יחס שיא-לרעש גבוה. בקורפוס
+                    // גיטרה ‎≫100, בטייק רעש ‎<10 — הפרדה בסדר גודל, לא כיול עדין.
+                    float noise_mean_now = raw_noise_tracker_.get_mean();
+                    bool proven_instrument = noise_mean_now > 0.0f &&
+                        session_peak_raw > noise_mean_now *
+                            silence_peak_cap_min_snr_.load(std::memory_order_relaxed);
+                    if (proven_instrument) {
+                        float peak_cap = session_peak_raw *
+                                         silence_peak_cap_ratio_.load(std::memory_order_relaxed);
+                        sil_floor = std::max(silence_abs_floor_.load(std::memory_order_relaxed),
+                                             std::min(sil_floor, peak_cap));
+                    }
                     float activity_floor = std::max(sil_floor,
                         session_peak_raw * activity_ratio_.load(std::memory_order_relaxed));
                     size_t silence_target = static_cast<size_t>(
@@ -1265,6 +1334,18 @@ void LooperEngine::process_audio_asynchronously() {
                     // מסלול ב' (איטי): היעדר פעילות — לזנב הד/ריברב שנשאר מעל סף השקט
                     if (raw_volume >= activity_floor) inactivity_count = 0;
                     else inactivity_count += local_chunk.size();
+
+                    // חיווי סגירה ל-UI: המרבי מבין שני המסלולים, מחושב מאותם מונים
+                    // *שמחליטים* בפועל (לא שחזור ב-Kotlin — שחזור היה משקר בדיוק
+                    // ברגע שהמשתמש צריך לסמוך עליו). ‎1.0 = נסגר בצ'אנק הזה.
+                    if (silence_target > 0 || inactivity_target > 0) {
+                        float p_sil = silence_target ?
+                            static_cast<float>(silence_samples_count) / static_cast<float>(silence_target) : 0.0f;
+                        float p_act = inactivity_target ?
+                            static_cast<float>(inactivity_count) / static_cast<float>(inactivity_target) : 0.0f;
+                        closure_progress_.store(std::clamp(std::max(p_sil, p_act), 0.0f, 1.0f),
+                                                std::memory_order_relaxed);
+                    }
 
                     // סגירה על המוקדם מבין השניים. הזנב הלא-מוזיקלי לקוונטיזציה הוא
                     // הזמן מאז שהפעילות פסקה — תחילת הדעיכה ≈ הסיום המוזיקלי, ולכן
@@ -1441,6 +1522,7 @@ void LooperEngine::process_audio_asynchronously() {
                     }
                     playback_read_idx_.store(0, std::memory_order_relaxed);
                     active_playback_idx_.store(slot, std::memory_order_release);
+                    reset_transport();   // בסיס חדש נולד מנגן, תמיד
                     current_state_.store(LooperState::LOOPING, std::memory_order_release);
                 } else {
                     current_state_.store(LooperState::IDLE, std::memory_order_release);
@@ -1588,8 +1670,14 @@ void LooperEngine::process_audio_asynchronously() {
             }
 
             case LooperState::OVERDUBBING: {
+                const bool auto_close = overdub_auto_close_.load(std::memory_order_relaxed);
                 if (loop_length_ > 0 && new_layer_.size() == loop_length_) {
                     for (float s : local_chunk) {
+                        // בסגירה-אוטומטית מפסיקים לצבור *ברגע* העטיפה: המשך הצ'אנק
+                        // שייך כבר לסיבוב הבא, וצבירתו הייתה מכפילה ~10ms על ראש
+                        // הלופ (פלאם בתפר). במצב הידני אין עטיפה-סופית מוגדרת ולכן
+                        // ההתנהגות נשארת בדיוק כשהייתה.
+                        if (auto_close && overdub_publish_pending) break;
                         new_layer_[overdub_idx] += s;   // צבירה גולמית לשכבה; ה-clip קורה במיקס
                         overdub_idx++;
                         if (overdub_idx >= loop_length_) {
@@ -1599,7 +1687,13 @@ void LooperEngine::process_audio_asynchronously() {
                     }
                 }
 
-                bool exit_requested = request_looping_.load(std::memory_order_relaxed);
+                // סגירה אוטומטית אחרי סיבוב אחד מלא: overdub_publish_pending נדלק
+                // בדיוק כשה-idx עטף — כלומר נצבר loop_length_ דגימות מנקודת הכניסה,
+                // סיבוב שלם. זה מבטל את *הנקישה השנייה* לכל שכבה (הנקישה שהרגה את
+                // הבטחת ה"בלי-מגע" מהשכבה השנייה והלאה). הבקשה הידנית עדיין גוברת,
+                // כך שכיבוי ההגדרה מחזיר בדיוק את ההתנהגות הקודמת.
+                bool exit_requested = request_looping_.load(std::memory_order_relaxed) ||
+                                      (overdub_publish_pending && auto_close);
 
                 if (overdub_publish_pending || exit_requested) {
                     // מוניטור/פרסום = committed_mix_ (גולמי) + new_layer_, עם ברך-רכה.

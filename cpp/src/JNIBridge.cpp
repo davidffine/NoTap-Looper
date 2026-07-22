@@ -36,12 +36,17 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_executeRecordStop(JNIEn
 // הרנדר.) חוזה האינדקסים (מראה מדויקת ב-AudioEngine.kt/LooperViewModel):
 //   [0]=rms · [1]=noise_std · [2]=transient(0/1) · [3]=state ordinal (חוזה
 //   LooperState: 0=CAL 1=IDLE 2=REC 3=PROC 4=LOOP 5=OVERDUB) · [4]=bpm ·
-//   [5]=loop_beats · [6]=loop_pos(0..1) · [7]=layer_count · [8]=denoised_count
+//   [5]=loop_beats · [6]=loop_pos(0..1) · [7]=layer_count · [8]=denoised_count ·
+//   [9]=transport_stopped(0/1) · [10]=output_muted(0/1) · [11]=closure_progress(0..1)
+//
+// 9-11 הם *מראה* של מצב שה-UI עצמו כתב — ובכל זאת נקראים מהמנוע ולא נזכרים
+// ב-Kotlin: ה-Worker מאפס טרנספורט בכל לופ חדש (clear/import/session/בסיס),
+// וזיכרון מקומי ב-UI היה נשאר תקוע על "עצור" מול מנוע שכבר מנגן.
 JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *env, jobject thiz, jfloatArray outData) {
     if (!g_engine || outData == nullptr) return;
-    if (env->GetArrayLength(outData) < 9) return;
+    if (env->GetArrayLength(outData) < 12) return;
 
-    jfloat telemetry[9];
+    jfloat telemetry[12];
     telemetry[0] = g_engine->current_rms_.load(std::memory_order_relaxed);
     telemetry[1] = g_engine->current_noise_std_dev_.load(std::memory_order_relaxed);
     // קריאה ואיפוס אטומי של דגל הטרנזיינט
@@ -52,9 +57,57 @@ JNIEXPORT void JNICALL Java_com_notap_looper_AudioEngine_pollTelemetry(JNIEnv *e
     telemetry[6] = g_engine->get_loop_position();
     telemetry[7] = static_cast<jfloat>(g_engine->get_layer_count());
     telemetry[8] = static_cast<jfloat>(g_engine->get_layer_denoise_count());
+    telemetry[9] = g_engine->is_transport_stopped() ? 1.0f : 0.0f;
+    telemetry[10] = g_engine->is_output_muted() ? 1.0f : 0.0f;
+    telemetry[11] = g_engine->get_closure_progress();
 
     // כתיבה חזרה למערך של Kotlin ללא הקצאות זיכרון חדשות
-    env->SetFloatArrayRegion(outData, 0, 9, telemetry);
+    env->SetFloatArrayRegion(outData, 0, 12, telemetry);
+}
+
+// --- טרנספורט: עצירה (שומרת לופ) והשתקה. הכפתור ההרסני היחיד היה ✕ עד כה. ---
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setTransportStopped(JNIEnv *env, jobject thiz, jboolean stopped) {
+    if (g_engine) g_engine->set_transport_stopped(stopped == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setOutputMuted(JNIEnv *env, jobject thiz, jboolean muted) {
+    if (g_engine) g_engine->set_output_muted(muted == JNI_TRUE);
+}
+
+// עוצמת ניטור (Master) 0..1 — משפיעה על מה ששומעים בלבד. הייצוא והשכבות
+// נשארים ברמה מלאה, ולכן "לנגן בשקט ב-23:00" לא מחליש את ההקלטה.
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setMasterVolume(JNIEnv *env, jobject thiz, jfloat volume) {
+    if (g_engine) g_engine->set_master_volume(volume);
+}
+
+// סגירה-אוטומטית של אוברדאב אחרי סיבוב אחד (ברירת מחדל: דלוק).
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setOverdubAutoClose(JNIEnv *env, jobject thiz, jboolean on) {
+    if (g_engine) g_engine->set_overdub_auto_close(on == JNI_TRUE);
+}
+
+// --- כוונון זיהוי שנחשף למשתמש ---
+// שני הכוונונים היחידים שנחשפים: כמה זמן להמתין לפני סגירה (סבלנות) וכמה גבוה
+// לשים את רצפת השקט (רגישות). שאר הכוונונים נשארים פנימיים — הם מכוילים מול
+// הקורפוס ואין למשתמש דרך להעריך אותם.
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setSilenceHoldSeconds(JNIEnv *env, jobject thiz, jfloat sec) {
+    if (g_engine) g_engine->set_silence_hold_seconds(sec);
+}
+
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setSilenceRelMult(JNIEnv *env, jobject thiz, jfloat mult) {
+    if (g_engine) g_engine->set_silence_rel_mult(mult);
+}
+
+// מסלול הסגירה האיטי (היעדר-פעילות) — זה שמכריע על זנב-צלצול/ריברב. "סבלנות"
+// שמזיזה רק את מסלול השקט המהיר לא משנה דבר בדיוק במקרה שבגללו המשתמש נגע בה.
+JNIEXPORT void JNICALL
+Java_com_notap_looper_AudioEngine_setActivityHoldSeconds(JNIEnv *env, jobject thiz, jfloat sec) {
+    if (g_engine) g_engine->set_activity_hold_seconds(sec);
 }
 
 // תצפית: סה"כ דגימות-כניסה שנשמטו (תור מלא). ~0 תמיד; חשיפה לקצה-מקרה פתולוגי.

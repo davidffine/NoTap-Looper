@@ -253,6 +253,38 @@ private:
     // [חדש] שמירת אונטולוגיית הזיהוי (0=Auto, 1=Tap, 2=BPM)
     std::atomic<int> detection_mode_{0};
 
+    // --- טרנספורט: עצירה / השתקה ---
+    // *לא* מצבי-מנוע אלא דגלים על נתיב הפלט בלבד. LooperState נוסף היה מחייב כל
+    // צרכן (acquire_writable_slot, טלמטריה, אונבורדינג, כל ה-switch של ה-Worker)
+    // להכיר מצב-נגינה שלישי — סיכון מיותר במכונת-מצבים מכוילת. הסמנטיקה:
+    //   transport_stopped_ = הקורא לא מתקדם, הפלט אפס, ראש-הקריאה חונה ב-0 ⇒
+    //                        "PLAY" מתחיל מראש הלופ (סמנטיקת דוושה, לא המשך).
+    //   output_muted_      = הקורא ממשיך להתקדם (הפאזה נשמרת) והפלט אפס בלבד ⇒
+    //                        המשתמש חוזר פנימה *בקצב*. המטרונום נשאר נשמע.
+    // נכתבים מ-JNI, נקראים ב-Thread של ה-Output. ה-Worker מאפס אותם בכל אירוע
+    // שמוליד לופ חדש (clear/import/session/בסיס חדש) — אחרת לופ חדש נולד אילם.
+    std::atomic<bool> transport_stopped_{false};
+    std::atomic<bool> output_muted_{false};
+
+    // עוצמת ניטור (Master). *לא* נכללת ב-reset_transport: זו העדפת האזנה של
+    // המשתמש ("שקט ב-23:00"), לא מצב פר-לופ. חלה על הפלט הסופי — כולל המטרונום —
+    // כי זו עוצמת *היציאה של האפליקציה*, לא של שכבה. אינה נוגעת ב-layers_,
+    // ולכן ייצוא/סשן/הקלטת אוברדאב יוצאים ברמה מלאה תמיד.
+    std::atomic<float> master_volume_{1.0f};
+    // מצב ההחלקה — Thread של ה-Output בלבד. בלי החלקה, גרירת סליידר ב-60fps
+    // מייצרת מדרגת-גיין בכל גבול-קולבק ("זיפר") שנשמעת על צליל מוחזק.
+    float master_volume_smoothed_{1.0f};
+
+    // סגירה-אוטומטית של אוברדאב אחרי *סיבוב אחד* מלא (ברירת המחדל).
+    // בלעדיה כל שכבה עולה שתי נקישות (הצתה + נעילה) — וזה הורג את הבטחת
+    // ה"בלי-מגע" מהשכבה השנייה והלאה. כבוי = התנהגות "צובר עד שתיגע" הישנה.
+    std::atomic<bool> overdub_auto_close_{true};
+
+    // התקדמות סגירת-הטייק (0..1) לחיווי ה-UI: המרבי מבין שני מסלולי הסגירה.
+    // 1.0 = ההקלטה נסגרת עכשיו. אפס בכל מצב שאינו RECORDING-אוטומטי. הנגזרת
+    // כאן היא *בדיוק* זו שמחליטה, ולא שחזור שלה ב-Kotlin — אחרת החיווי משקר.
+    std::atomic<float> closure_progress_{0.0f};
+
     // פרמטרי כוונון: נכתבים מ-JNI, נקראים על ה-Worker — אטומיים.
     // כוונון 2026-07-12 (גרסה חסינת-Gain): כל הרצפות המוחלטות הפכו ל-Bootstrap
     // מזערי בלבד (הגנה מאבק דיגיטלי בחדר מת); ההפרדה האמיתית עברה למכפלות
@@ -310,6 +342,16 @@ private:
     std::atomic<float> silence_hold_seconds_{1.5f};
     std::atomic<float> activity_ratio_{0.15f};        // שבריר השיא שנחשב "פעיל" (כ--16dB)
     std::atomic<float> activity_hold_seconds_{4.5f};  // משך היעדר-פעילות רצוף לסגירה
+    // תקרה יחסית-לשיא-הטייק על רצפת השקט. הרצפה היחסית-לרעש (mean×12) נבנתה
+    // לחדר-הייחוס; בחדר רועש mean גדל והרצפה מטפסת עד *לתוך* טווח הנגינה, ואז
+    // פסאז' פיאניסימו (פינגרסטייל קלאסי) נספר כשקט וההקלטה נסגרת באמצע ביטוי.
+    // אילוץ הסדר הנכון בין שני מסלולי הסגירה: רצפת-שקט ≤ רצפת-פעילות (0.15 מהשיא).
+    // 0.08 = חצי מרצפת הפעילות ⇒ המסלול המהיר נשאר מהיר, בלי לבלוע נגינה שקטה.
+    std::atomic<float> silence_peak_cap_ratio_{0.08f};
+    // שער ההרפיה: התקרה לעיל מוחלת רק כשהטייק מוכח כנגינה (שיא/רעש מעל היחס
+    // הזה). בלעדיו טייק שהוצת מרעש מרפה את רצפתו שלו ומפרסם לופ-זבל — נמדד
+    // ונכשל בכל נקודת מטריצה בקורפוס השלילי. ראה LooperEngine.cpp.
+    std::atomic<float> silence_peak_cap_min_snr_{20.0f};
 
     float calculate_rms(const std::vector<float>& chunk);
     size_t find_true_onset(const std::vector<float>& audio_data, size_t max_search_samples, float threshold);
@@ -441,6 +483,24 @@ public:
     void set_silence_hold_seconds(float sec) { silence_hold_seconds_.store(sec, std::memory_order_relaxed); }
     void set_activity_hold_seconds(float sec) { activity_hold_seconds_.store(sec, std::memory_order_relaxed); }
     void set_activity_ratio(float ratio) { activity_ratio_.store(ratio, std::memory_order_relaxed); }
+    void set_silence_peak_cap_ratio(float r) { silence_peak_cap_ratio_.store(r, std::memory_order_relaxed); }
+
+    // --- טרנספורט (נקרא ב-Thread של ה-Output; נכתב מ-JNI) ---
+    void set_transport_stopped(bool v) { transport_stopped_.store(v, std::memory_order_relaxed); }
+    void set_output_muted(bool v) { output_muted_.store(v, std::memory_order_relaxed); }
+    /** עוצמת ניטור לינארית 0..1 (עקומת הסליידר נקבעת ב-UI). */
+    void set_master_volume(float v) {
+        master_volume_.store(std::clamp(v, 0.0f, 1.0f), std::memory_order_relaxed);
+    }
+    float get_master_volume() const { return master_volume_.load(std::memory_order_relaxed); }
+    bool is_transport_stopped() const { return transport_stopped_.load(std::memory_order_relaxed); }
+    bool is_output_muted() const { return output_muted_.load(std::memory_order_relaxed); }
+
+    void set_overdub_auto_close(bool v) { overdub_auto_close_.store(v, std::memory_order_relaxed); }
+    bool get_overdub_auto_close() const { return overdub_auto_close_.load(std::memory_order_relaxed); }
+
+    // התקדמות סגירת הטייק (0..1) לחיווי; 0 כשלא רלוונטי.
+    float get_closure_progress() const { return closure_progress_.load(std::memory_order_relaxed); }
     DynamicThresholdTracker& get_noise_tracker() { return noise_tracker_; }
     DynamicThresholdTracker& get_raw_noise_tracker() { return raw_noise_tracker_; }
 
